@@ -7,6 +7,7 @@ import {
   bridgeLegacyMeters,
   monitorTrackLevel,
 } from '../core/index.js';
+import { IcecastPublisher, ICECAST_MIME_OPTIONS } from './icecast-publisher.js?v=2';
 
 const STUDIO_ROOT_ID = 'podcast-root';
 const ROSTER_REFRESH_MS = 1500;
@@ -17,6 +18,11 @@ const DROPBOX_GUIDE_URL = '/cloud.html#dropbox';
 const CLOUD_STATUS_STORAGE_KEY = 'podcastStudio.cloudStatus';
 const CLOUD_STATUS_STALE_MS = 30 * 60 * 1000;
 const DISK_RECORDING_STORAGE_KEY = 'podcastStudio.diskRecordingState';
+const CAPTURE_MODE_STORAGE_KEY = 'podcastStudio.captureMode';
+const ICECAST_SETTINGS_STORAGE_KEY = 'podcastStudio.icecastSettings';
+const ICECAST_SETTINGS_VERSION = 2;
+const DEFAULT_ICECAST_MIME_TYPE = ICECAST_MIME_OPTIONS[0].value;
+const DEFAULT_ICECAST_RELAY_URL = 'https://vdo-ninja-icecast-relay.vdo.workers.dev/publish';
 const DISK_DB_NAME = 'podcastStudio.disk';
 const DISK_DB_STORE = 'handles';
 const PODCAST_CLOUD_EVENT = 'podcast-cloud-status';
@@ -25,7 +31,12 @@ const PODCAST_RECORD_PLAN_EVENT = 'podcast-record-plan';
 const PODCAST_RECORD_STATUS_EVENT = 'podcast-record-status';
 const UPLOAD_TRACKER_COOLDOWN_MS = 15000;
 const DRIVE_PROGRESS_EVENT = 'vdoninja:gdrive-progress';
+const REMOTE_RECORDER_EVENT = 'vdoninja:remote-recorder-status';
+const DEFAULT_GUEST_BACKUP_BITRATE = 6000;
 const DRIVE_STATUS_RESET_MS = 8000;
+const DRIVE_REQUEST_ACK_TIMEOUT_MS = 12000;
+const DRIVE_REQUEST_STALE_TIMEOUT_MS = 60000;
+const DRIVE_RECORDER_HEARTBEAT_GRACE_MS = DRIVE_REQUEST_STALE_TIMEOUT_MS + 15000;
 const DRIVE_STATUS_MESSAGES = {
   idle: 'Drive idle',
   pending: 'Drive readying…',
@@ -46,6 +57,8 @@ const STUDIO_DISK_FEATURE_FLAG = (() => {
   return enabled;
 })();
 
+const STUDIO_VIDEO_FEATURE_FLAG = true;
+
 function injectStylesheet() {
   if (document.getElementById('podcast-studio-style')) {
     return;
@@ -53,7 +66,7 @@ function injectStylesheet() {
   const link = document.createElement('link');
   link.id = 'podcast-studio-style';
   link.rel = 'stylesheet';
-  link.href = new URL('./studio.css', import.meta.url).toString();
+  link.href = new URL('./studio.css?v=15', import.meta.url).toString();
   document.head.appendChild(link);
 }
 
@@ -73,6 +86,48 @@ function createElement(tag, className, attrs = {}) {
     }
   });
   return el;
+}
+
+function makeCollapsible(panel, title, storageKey = null) {
+  panel.dataset.collapsible = 'true';
+
+  // Add title h2 if provided and panel doesn't already have one
+  if (title && !panel.querySelector('h2')) {
+    const h2 = createElement('h2', '', { text: title });
+    panel.insertBefore(h2, panel.firstChild);
+  }
+
+  // Create toggle button (will be positioned absolute in top right via CSS)
+  const toggle = createElement('button', 'panel-collapse-toggle', { type: 'button', text: '−', title: 'Collapse section' });
+
+  // Load saved state
+  let collapsed = false;
+  if (storageKey) {
+    try {
+      collapsed = localStorage.getItem(storageKey) === 'true';
+    } catch (e) {}
+  }
+
+  const updateState = () => {
+    panel.dataset.collapsed = collapsed ? 'true' : 'false';
+    toggle.textContent = collapsed ? '+' : '−';
+    toggle.title = collapsed ? 'Expand section' : 'Collapse section';
+    if (storageKey) {
+      try {
+        localStorage.setItem(storageKey, collapsed ? 'true' : 'false');
+      } catch (e) {}
+    }
+  };
+
+  toggle.addEventListener('click', () => {
+    collapsed = !collapsed;
+    updateState();
+  });
+
+  panel.appendChild(toggle);
+  updateState();
+
+  return { toggle };
 }
 
 function dispatchStudioEvent(name, detail = {}) {
@@ -561,6 +616,103 @@ function readDiskRecordingState() {
   }
 }
 
+function readCaptureMode() {
+  try {
+    const raw = window.localStorage.getItem(CAPTURE_MODE_STORAGE_KEY);
+    const normalized = (raw || 'audio').toString().toLowerCase();
+    if (normalized === 'video') {
+      return 'video';
+    }
+  } catch (error) {
+    console.warn('Unable to read capture mode', error);
+  }
+  return 'audio';
+}
+
+function writeCaptureMode(mode) {
+  const normalized = mode === 'video' ? 'video' : 'audio';
+  try {
+    window.localStorage.setItem(CAPTURE_MODE_STORAGE_KEY, normalized);
+  } catch (error) {
+    console.warn('Unable to persist capture mode', error);
+  }
+  return normalized;
+}
+
+function readIcecastSettings() {
+  try {
+    const raw = window.localStorage.getItem(ICECAST_SETTINGS_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      return {};
+    }
+    const settings = { ...parsed };
+    const version = Number(settings.version || 0);
+    if (version < ICECAST_SETTINGS_VERSION && (!settings.mimeType || settings.mimeType === 'audio/webm;codecs=opus' || settings.mimeType === 'audio/webm')) {
+      settings.mimeType = DEFAULT_ICECAST_MIME_TYPE;
+    }
+    settings.version = ICECAST_SETTINGS_VERSION;
+    return settings;
+  } catch (error) {
+    console.warn('Unable to read Icecast settings', error);
+    return {};
+  }
+}
+
+function writeIcecastSettings(settings) {
+  const safeSettings = { ...(settings || {}) };
+  delete safeSettings.relayUrl;
+  delete safeSettings.relayToken;
+  safeSettings.version = ICECAST_SETTINGS_VERSION;
+  try {
+    window.localStorage.setItem(ICECAST_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
+  } catch (error) {
+    console.warn('Unable to store Icecast settings', error);
+  }
+}
+
+function readUrlParam(name) {
+  try {
+    if (typeof urlParams !== 'undefined' && urlParams && typeof urlParams.get === 'function') {
+      return urlParams.get(name) || '';
+    }
+  } catch (error) {
+    console.warn('Unable to read URL params', error);
+  }
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get(name) || '';
+  } catch (error) {
+    console.warn('Unable to parse URL params', error);
+  }
+  return '';
+}
+
+function resolveIcecastRelayUrl(settings = {}) {
+  const configured =
+    (typeof window !== 'undefined' && typeof window.VDO_NINJA_ICECAST_RELAY_URL === 'string'
+      ? window.VDO_NINJA_ICECAST_RELAY_URL
+      : '') ||
+    readUrlParam('icecastrelay') ||
+    readUrlParam('icecastrelayurl') ||
+    settings.relayUrl ||
+    DEFAULT_ICECAST_RELAY_URL;
+  return (configured || '').trim();
+}
+
+function resolveIcecastRelayToken() {
+  const configured =
+    (typeof window !== 'undefined' && typeof window.VDO_NINJA_ICECAST_RELAY_TOKEN === 'string'
+      ? window.VDO_NINJA_ICECAST_RELAY_TOKEN
+      : '') ||
+    readUrlParam('icecastrelaytoken');
+  return (configured || '').trim();
+}
+
+
 function isDiskRecordingEnabled() {
   const state = readDiskRecordingState();
   return Boolean(state.folderName && state.enabled);
@@ -694,8 +846,6 @@ async function chooseDiskRecordingDirectory() {
 
 function buildRoomGate(defaults = {}) {
   injectStylesheet();
-  document.body.classList.remove('hidden');
-  document.body.classList.add('podcast-studio-mode');
 
   const gate = createElement('div', '', { id: 'podcast-room-gate' });
   const panel = createElement('div', 'podcast-room-gate__panel');
@@ -710,6 +860,7 @@ function buildRoomGate(defaults = {}) {
   const roomInput = createElement('input');
   roomInput.name = 'room';
   roomInput.placeholder = defaults.roomPlaceholder || 'podcast-hq';
+  roomInput.title = 'This name becomes the room slug used in guest links.';
   roomInput.autocomplete = 'off';
   roomInput.autocapitalize = 'off';
   roomInput.spellcheck = false;
@@ -723,6 +874,7 @@ function buildRoomGate(defaults = {}) {
   const passwordInput = createElement('input');
   passwordInput.name = 'password';
   passwordInput.placeholder = 'Leave blank to skip';
+  passwordInput.title = 'Optional room password for guests and directors.';
   passwordInput.type = 'text';
   passwordInput.autocomplete = 'off';
   passwordInput.autocapitalize = 'off';
@@ -735,14 +887,25 @@ function buildRoomGate(defaults = {}) {
   const errorNode = createElement('div', 'podcast-room-gate__error');
 
   const actions = createElement('div', 'podcast-room-gate__actions');
-  const cancelButton = createElement('button', 'podcast-room-gate__cancel', { type: 'button', text: 'Back to classic' });
-  const submitButton = createElement('button', 'podcast-room-gate__submit', { type: 'submit', text: 'Enter studio' });
+  const cancelButton = createElement('button', 'podcast-room-gate__cancel', {
+    type: 'button',
+    text: 'Back to classic',
+    title: 'Return to the classic VDO.Ninja interface.',
+  });
+  const submitButton = createElement('button', 'podcast-room-gate__submit', {
+    type: 'submit',
+    text: 'Enter studio',
+    title: 'Enter the podcast studio for this room.',
+  });
   actions.append(submitButton, cancelButton);
 
   form.append(roomLabel, passwordLabel, errorNode, actions);
   panel.append(title, subtitle, form);
   gate.append(panel);
   document.body.append(gate);
+
+  document.body.classList.remove('hidden');
+  document.body.classList.add('podcast-studio-mode');
 
   setTimeout(() => {
     roomInput.focus();
@@ -765,8 +928,6 @@ async function ensureRoomSelection() {
   const existing = getRoomSlugFromParams(params);
   if (existing) {
     injectStylesheet();
-    document.body.classList.remove('hidden');
-    document.body.classList.add('podcast-studio-mode');
     const preflight = await runPreflightChecklist({ roomSlug: existing });
     if (preflight?.redirect) {
       return preflight;
@@ -864,7 +1025,7 @@ function createPreflightRow(label, description, options = {}) {
 
   let actionButton = null;
   if (showAction) {
-    actionButton = createElement('button', 'preflight-row__action', { type: 'button', text: actionLabel });
+    actionButton = createElement('button', 'preflight-row__action', { type: 'button', text: actionLabel, title: `Run: ${label}` });
     controls.append(actionButton);
   }
 
@@ -915,12 +1076,17 @@ async function runPreflightChecklist({ roomSlug } = {}) {
 
   // If the user just completed the preflight moments ago, allow immediate pass-through.
   if (stored.completedAt && now - stored.completedAt < PREFLIGHT_MIN_MANDATORY_MS) {
+    document.body.classList.remove('hidden');
+    document.body.classList.add('podcast-studio-mode');
     return { roomSlug, skipped: true };
   }
 
   const overlay = createElement('div', 'podcast-preflight-backdrop');
   overlay.dataset.podcastOverlay = 'true';
+  // Inline styles ensure overlay is styled before external CSS loads
+  overlay.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.85);z-index:9999';
   const panel = createElement('div', 'podcast-preflight-panel');
+  panel.style.cssText = 'background:#1a1d24;padding:32px;border-radius:12px;color:#fff;max-width:480px;width:90%';
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-modal', 'true');
   panel.setAttribute('aria-label', 'Podcast studio preflight checklist');
@@ -954,16 +1120,6 @@ async function runPreflightChecklist({ roomSlug } = {}) {
     setPreflightRowState(camRow, 'ready', `Last checked ${formatRelativeTime(stored.cameraSuccessAt)}.`);
   }
 
-  const cloudRow = createPreflightRow('Cloud sync', 'Link Google Drive or Dropbox before recording so uploads can start immediately.', {
-    initialStatus: 'pending',
-    showAction: true,
-    actionLabel: 'Check status',
-  });
-  if (cloudRow.actionButton) {
-    cloudRow.actionButton.dataset.initialLabel = 'Check status';
-  }
-  setPreflightRowState(cloudRow, 'pending', 'Checking saved tokens…');
-
   const diskRow = createPreflightRow(
     'Local disk recording',
     'Select a destination folder for ISO files (optional but recommended).',
@@ -982,26 +1138,25 @@ async function runPreflightChecklist({ roomSlug } = {}) {
     window.showDirectoryPicker ? 'No folder selected yet.' : 'Local disk recording requires the File System Access API (Chromium-based browsers).'
   );
 
-  checklist.append(micRow.row, camRow.row, cloudRow.row, diskRow.row);
+  checklist.append(micRow.row, camRow.row, diskRow.row);
 
   const actions = createElement('div', 'preflight-actions');
-  const continueButton = createElement('button', 'preflight-primary', { type: 'button', text: 'Enter Control Room' });
-  const skipButton = createElement('button', 'preflight-secondary', { type: 'button', text: 'Skip preflight' });
+  const continueButton = createElement('button', 'preflight-primary', { type: 'button', text: 'Enter Control Room', title: 'Enter the podcast studio.' });
+  const skipButton = createElement('button', 'preflight-secondary', { type: 'button', text: 'Skip preflight', title: 'Skip these checks and enter the studio.' });
   actions.append(continueButton, skipButton);
 
   panel.append(heading, subtitle, checklist, actions);
   overlay.append(panel);
   document.body.append(overlay);
 
+  document.body.classList.remove('hidden');
+  document.body.classList.add('podcast-studio-mode');
+
   let micOk = Boolean(micFresh);
   let camOk = Boolean(camFresh);
-  let cloudTimer = null;
-  let cloudOk = false;
   let diskReady = false;
   let destroyed = false;
-  let cloudStatusListener = null;
   let diskStatusListener = null;
-  let cloudLastChecked = null;
   let resolver;
   const completion = new Promise((resolve) => {
     resolver = resolve;
@@ -1012,14 +1167,6 @@ async function runPreflightChecklist({ roomSlug } = {}) {
       return;
     }
     destroyed = true;
-    if (cloudTimer) {
-      clearInterval(cloudTimer);
-      cloudTimer = null;
-    }
-    if (cloudStatusListener) {
-      window.removeEventListener(PODCAST_CLOUD_EVENT, cloudStatusListener);
-      cloudStatusListener = null;
-    }
     if (diskStatusListener) {
       window.removeEventListener(PODCAST_DISK_EVENT, diskStatusListener);
       diskStatusListener = null;
@@ -1118,42 +1265,6 @@ async function runPreflightChecklist({ roomSlug } = {}) {
     });
   }
 
-  async function refreshCloudRowStatus({ manual = false } = {}) {
-    cloudLastChecked = Date.now();
-    const state = readCloudLinkStatus();
-    const driveFresh = isCloudLinkFresh(state.drive);
-    const dropboxFresh = isCloudLinkFresh(state.dropbox);
-    const summaries = [];
-    summaries.push(
-      driveFresh
-        ? `Drive linked ${formatRelativeTime(state.drive.linkedAt) || 'recently'}`
-        : 'Drive not linked',
-    );
-    summaries.push(
-      dropboxFresh
-        ? `Dropbox linked ${formatRelativeTime(state.dropbox.linkedAt) || 'recently'}`
-        : 'Dropbox not linked',
-    );
-    cloudOk = driveFresh || dropboxFresh;
-    const summaryText = summaries.join(' • ');
-    const checkedSuffix = cloudLastChecked ? `Checked ${formatRelativeTime(cloudLastChecked)}.` : '';
-    if (cloudOk) {
-      setPreflightRowState(
-        cloudRow,
-        'ready',
-        `${summaryText}.${checkedSuffix ? ` ${checkedSuffix}` : ''}`,
-      );
-    } else {
-      setPreflightRowState(
-        cloudRow,
-        'error',
-        `${summaryText}. Link your cloud targets from inside the control room.${
-          checkedSuffix ? ` ${checkedSuffix}` : ''
-        }`,
-      );
-    }
-  }
-
   async function refreshDiskRowStatus({ interactive = false } = {}) {
     if (typeof window.showDirectoryPicker !== 'function') {
       diskReady = false;
@@ -1198,23 +1309,9 @@ async function runPreflightChecklist({ roomSlug } = {}) {
     }
   }
 
-  refreshCloudRowStatus();
   refreshDiskRowStatus();
-  cloudTimer = setInterval(() => {
-    refreshCloudRowStatus({ manual: false });
-    refreshDiskRowStatus();
-  }, 8000);
-  cloudStatusListener = () => refreshCloudRowStatus();
   diskStatusListener = () => refreshDiskRowStatus();
-  window.addEventListener(PODCAST_CLOUD_EVENT, cloudStatusListener);
   window.addEventListener(PODCAST_DISK_EVENT, diskStatusListener);
-
-  if (cloudRow.actionButton) {
-    cloudRow.actionButton.addEventListener('click', () => {
-      setPreflightRowState(cloudRow, 'testing', 'Re-checking your saved cloud tokens…');
-      refreshCloudRowStatus({ manual: true });
-    });
-  }
 
   if (diskRow.actionButton) {
     diskRow.actionButton.addEventListener('click', async () => {
@@ -1338,6 +1435,8 @@ class PodcastStudioApp {
     this.rosterDriveButtons = new Map();
     this.rosterDriveStatuses = new Map();
     this.driveStatusResetTimers = new Map();
+    this.driveRequestTimers = new Map();
+    this.driveRecorderStates = new Map();
     this.driveProgressSnapshots = new Map();
     this.meterValues = new Map();
     this.outputIndicators = new Map();
@@ -1346,8 +1445,12 @@ class PodcastStudioApp {
     this.spectrograms = new Map();
     this.participantMetrics = new Map();
     this.markers = [];
+    this.markerActions = null;
+    this.markerExportButton = null;
+    this.markerCopyButton = null;
+    this.markerCopyResetTimer = null;
+    this.autoMarkerTimeout = null;
     this.rosterTimer = null;
-    this.pendingDriveUploads = [];
     this.levelOff = null;
     this.recordStartedAt = null;
     this.driveStatusNode = null;
@@ -1363,6 +1466,8 @@ class PodcastStudioApp {
     this.hostMicStatusNode = null;
     this.hostMicErrorNode = null;
     this.hostMicBusy = false;
+    this.hostMicMuted = false;
+    this.hostMuteButton = null;
     this.cloudBusy = {
       drive: false,
       dropbox: false,
@@ -1423,11 +1528,44 @@ class PodcastStudioApp {
     this.diskStateListener = null;
     this.cloudStateListener = null;
     this.cloudSummaryNode = null;
-    this.diskSummaryNode = null;
+    this.captureSummaryNode = null;
+    this.backupSummaryNode = null;
+    this.saveSummaryNode = null;
+    this.summaryWarningNode = null;
+    this.recordingSummary = null;
+    this.destinationLights = { download: null, drive: null, dropbox: null, disk: null };
+    this.guestBackupRow = null;
+    this.guestBackupHint = null;
+    this.isoSummary = null;
+    this.captureModeSelect = null;
     this.recordingStatusNode = null;
+    this.recordingStatusTimer = null;
+    this.recordingStatusBase = 'Idle';
+    this.recordingStatusState = 'idle';
+    this.recordTransitioning = false;
     this.recordingPlan = null;
     this.recordingSessionId = null;
     this.boundDriveProgressHandler = null;
+    this.boundRemoteRecorderHandler = null;
+    this.guestBackupBusy = false;
+    this.guestBackupButton = null;
+    this.guestBackupStatusNode = null;
+    this.currentRecordingMode = readCaptureMode();
+    this.icecastPublisher = null;
+    this.icecastButton = null;
+    this.icecastSettingsButton = null;
+    this.icecastSettingsPanel = null;
+    this.icecastStatusNode = null;
+    this.icecastTargetInput = null;
+    this.icecastUsernameInput = null;
+    this.icecastPasswordInput = null;
+    this.icecastMimeSelect = null;
+    this.icecastPublicInput = null;
+    this.icecastNameInput = null;
+    this.icecastGenreInput = null;
+    this.icecastLive = false;
+    this.icecastBusy = false;
+    this.icecastSettingsOpen = false;
   }
 
   async init() {
@@ -1445,10 +1583,18 @@ class PodcastStudioApp {
       monitorLevels: true,
       timeslice: 1000,
     });
+    this.icecastPublisher = new IcecastPublisher({
+      audioContext: this.audioContext,
+      getParticipants: () => this.getIcecastMixParticipants(),
+    });
+    this.attachIcecastEvents();
     this.cloud = new CloudUploadCoordinator(this.session);
 
     this.roomName = this.resolveRoomName();
     this.buildLayout();
+    this.updateIcecastUI();
+    this.updateReadinessSummary();
+    this.updateRecordingButtons();
     if (STUDIO_DISK_FEATURE_FLAG) {
       this.diskStateListener = () => {
         this.updateDiskRecordingUI();
@@ -1460,6 +1606,8 @@ class PodcastStudioApp {
     window.addEventListener(PODCAST_CLOUD_EVENT, this.cloudStateListener);
     this.boundDriveProgressHandler = (event) => this.handleDriveProgressEvent(event);
     window.addEventListener(DRIVE_PROGRESS_EVENT, this.boundDriveProgressHandler);
+    this.boundRemoteRecorderHandler = (event) => this.handleRemoteRecorderStatusEvent(event);
+    window.addEventListener(REMOTE_RECORDER_EVENT, this.boundRemoteRecorderHandler);
     this.updateRoomIndicator();
     this.updateCloudFooter();
     this.attachRecorderEvents();
@@ -1495,20 +1643,23 @@ class PodcastStudioApp {
     if (latest !== this.roomName) {
       this.roomName = latest;
       if (this.sessionInfo) {
-        this.sessionInfo.textContent = 'Room: ' + (this.roomName || '—');
+        this.sessionInfo.textContent = this.roomName || '';
       }
       if (this.roomName) {
         const stored = readStoredRoomState();
         persistStoredRoomState({ room: this.roomName, password: stored?.password || '' });
       }
-    } else if (!this.roomName && this.sessionInfo) {
-      this.sessionInfo.textContent = 'Room: —';
     }
     this.updateInviteLink();
   }
 
   describeInviteOptions() {
     const labels = [];
+    if (this.inviteOptionNodes.disableVideo?.checked) {
+      labels.push('Audio only');
+    } else {
+      labels.push('Video preview');
+    }
     if (this.inviteOptionNodes.proAudio?.checked) {
       labels.push('Pro audio');
     }
@@ -1581,7 +1732,6 @@ class PodcastStudioApp {
 
     const params = new URLSearchParams();
     params.set('room', room);
-    params.set('miconly', '1');
     params.set('style', '2');
     params.set('showlabel', '1');
     params.set('tips', '1');
@@ -1589,10 +1739,17 @@ class PodcastStudioApp {
 
     const options = this.inviteOptionNodes || {};
     const summary = [];
-    summary.push('Mic only');
     summary.push('Label prompt');
     summary.push('Name tag overlay');
     summary.push('Join tips');
+
+    // Video is ON by default
+    if (options.disableVideo?.checked) {
+      params.set('miconly', '1');
+      summary.push('Audio only');
+    } else {
+      summary.push('Video enabled');
+    }
 
     if (options.proAudio?.checked) {
       params.set('proaudio', '1');
@@ -1628,6 +1785,13 @@ class PodcastStudioApp {
     } else {
       params.delete('agc');
       params.delete('autogain');
+    }
+
+    if (options.guestRecordBackup?.checked) {
+      params.set('autorecordlocal', '-128');
+      summary.push('Audio backup');
+    } else {
+      params.delete('autorecordlocal');
     }
 
     guestUrl.search = params.toString();
@@ -1720,10 +1884,10 @@ class PodcastStudioApp {
       if (this.hostMicBusy || this.recording) {
         this.hostMicButton.disabled = true;
         const busyLabel = this.hostMic?.active ? 'Disabling…' : 'Enabling…';
-        this.hostMicButton.textContent = this.recording ? 'Host mic locked during record' : busyLabel;
+        this.hostMicButton.textContent = this.recording ? 'Locked' : busyLabel;
       } else {
         this.hostMicButton.disabled = false;
-        this.hostMicButton.textContent = this.hostMic?.active ? 'Disable Host Mic' : 'Enable Host Mic';
+        this.hostMicButton.textContent = this.hostMic?.active ? 'Disable' : 'Enable';
       }
       if (this.hostMic?.active) {
         this.hostMicButton.classList.add('active');
@@ -1733,13 +1897,14 @@ class PodcastStudioApp {
     }
     if (this.hostMicStatusNode) {
       if (this.hostMic?.active) {
-        this.hostMicStatusNode.textContent = 'Microphone live';
+        this.hostMicStatusNode.textContent = 'Live';
         this.hostMicStatusNode.dataset.state = 'active';
       } else {
-        this.hostMicStatusNode.textContent = 'Microphone idle';
+        this.hostMicStatusNode.textContent = 'Idle';
         this.hostMicStatusNode.dataset.state = 'idle';
       }
     }
+    this.updateHostMuteUI();
   }
 
   async handleHostMicToggle() {
@@ -1754,6 +1919,31 @@ class PodcastStudioApp {
       await this.disableHostMic();
     } else {
       await this.enableHostMic();
+    }
+  }
+
+  handleHostMuteToggle() {
+    if (!this.hostMic?.active) {
+      return;
+    }
+    this.hostMicMuted = !this.hostMicMuted;
+    if (this.hostMic.track) {
+      this.hostMic.track.enabled = !this.hostMicMuted;
+    }
+    this.updateHostMuteUI();
+  }
+
+  updateHostMuteUI() {
+    if (this.hostMuteButton) {
+      if (this.hostMic?.active) {
+        this.hostMuteButton.disabled = false;
+        this.hostMuteButton.textContent = this.hostMicMuted ? '🔇 Unmute' : '🔊 Mute';
+        this.hostMuteButton.classList.toggle('muted', this.hostMicMuted);
+      } else {
+        this.hostMuteButton.disabled = true;
+        this.hostMuteButton.textContent = '🔊 Mute';
+        this.hostMuteButton.classList.remove('muted');
+      }
     }
   }
 
@@ -1865,6 +2055,7 @@ class PodcastStudioApp {
       this.virtualParticipants.delete('host-mic');
       this.hostMic = null;
       this.hostMicBusy = false;
+      this.hostMicMuted = false;
       this.setHostMicError('');
       this.updateHostMicUI();
       this.applyMeterValue('host-mic', 0);
@@ -1894,27 +2085,23 @@ class PodcastStudioApp {
     }
 
     if (this.cloudLinkButtons.drive) {
-      this.cloudLinkButtons.drive.textContent = driveLinked ? 'Reauthorize Drive' : 'Link Google Drive';
+      this.cloudLinkButtons.drive.textContent = driveLinked ? 'Reconnect Drive' : 'Connect';
       this.cloudLinkButtons.drive.disabled = Boolean(this.cloudBusy.drive) || this.recording;
       this.cloudLinkButtons.drive.dataset.state = driveLinked ? 'linked' : 'idle';
     }
     if (this.cloudLinkStatusNodes.drive) {
-      this.cloudLinkStatusNodes.drive.textContent = driveLinked ? 'Linked' : 'Not linked';
+      this.cloudLinkStatusNodes.drive.textContent = driveLinked ? 'Connected — guests upload directly' : 'Not connected';
       this.cloudLinkStatusNodes.drive.dataset.state = driveLinked ? 'linked' : 'idle';
     }
-    if (driveLinked && this.pendingDriveUploads.length) {
-      this.flushPendingDriveUploads().catch((error) => {
-        console.warn('Pending Drive uploads failed to resume', error);
-      });
-    }
+
 
     if (this.cloudLinkButtons.dropbox) {
-      this.cloudLinkButtons.dropbox.textContent = dropboxLinked ? 'Refresh Dropbox' : 'Link Dropbox';
+      this.cloudLinkButtons.dropbox.textContent = dropboxLinked ? 'Reconnect Dropbox' : 'Connect';
       this.cloudLinkButtons.dropbox.disabled = Boolean(this.cloudBusy.dropbox) || this.recording;
       this.cloudLinkButtons.dropbox.dataset.state = dropboxLinked ? 'linked' : 'idle';
     }
     if (this.cloudLinkStatusNodes.dropbox) {
-      this.cloudLinkStatusNodes.dropbox.textContent = dropboxLinked ? 'Linked' : 'Not linked';
+      this.cloudLinkStatusNodes.dropbox.textContent = dropboxLinked ? 'Connected — uploads after recording' : 'Not connected';
       this.cloudLinkStatusNodes.dropbox.dataset.state = dropboxLinked ? 'linked' : 'idle';
     }
     if (this.dropboxTokenInput) {
@@ -1965,23 +2152,22 @@ class PodcastStudioApp {
     }
     try {
       this.diskFolderButton.disabled = true;
-      this.diskFolderButton.textContent = 'Waiting for folder…';
+      this.diskFolderButton.textContent = '…';
       await chooseDiskRecordingDirectory();
       const result = await verifyStoredDiskRecordingDirectory({ requestPermission: true });
       if (!result.ok) {
-        throw new Error(result.message || 'Folder verification failed.');
+        throw new Error(result.message || 'Failed');
       }
       if (autoEnable || isDiskRecordingEnabled()) {
         setDiskRecordingEnabled(true);
         this.diskRecordingEnabled = true;
       }
-      this.diskFolderButton.textContent = 'Change folder';
     } catch (error) {
       console.warn('Disk folder selection failed', error);
       this.diskStatusNode.textContent =
         error?.name === 'AbortError' || /cancel/i.test(error?.message || '')
-          ? 'Folder selection cancelled.'
-          : error?.message || 'Unable to select folder.';
+          ? 'Cancelled'
+          : error?.message || 'Error';
       this.diskStatusNode.dataset.state = 'error';
     } finally {
       this.diskFolderButton.disabled = false;
@@ -2032,26 +2218,25 @@ class PodcastStudioApp {
     if (this.diskToggleButton) {
       this.diskToggleButton.disabled = !diskSupported;
       this.diskToggleButton.dataset.state = enabled ? 'enabled' : 'disabled';
-      this.diskToggleButton.textContent = enabled ? 'Local disk armed' : 'Setup local disk recording';
+      this.diskToggleButton.textContent = enabled ? 'Armed ✓' : 'Arm';
       this.diskToggleButton.setAttribute('aria-pressed', enabled ? 'true' : 'false');
     }
     if (this.diskFolderButton) {
       this.diskFolderButton.disabled = !diskSupported;
-      this.diskFolderButton.textContent = hasFolder ? 'Change folder' : diskSupported ? 'Choose folder' : 'Not supported';
+      this.diskFolderButton.textContent = hasFolder ? 'Change' : diskSupported ? 'Folder' : 'N/A';
     }
     if (this.diskStatusNode) {
       if (!diskSupported) {
-        this.diskStatusNode.textContent = 'Local disk recording requires the File System Access API.';
+        this.diskStatusNode.textContent = 'Requires Chrome/Edge';
         this.diskStatusNode.dataset.state = 'error';
       } else if (!hasFolder) {
-        this.diskStatusNode.textContent = 'Folder not selected.';
+        this.diskStatusNode.textContent = 'No folder selected';
         this.diskStatusNode.dataset.state = 'pending';
       } else if (meta.lastError) {
-        this.diskStatusNode.textContent = `${meta.folderName} — ${meta.lastError}`;
+        this.diskStatusNode.textContent = `${meta.folderName} — error`;
         this.diskStatusNode.dataset.state = 'error';
       } else {
-        const verified = meta.lastVerifiedAt ? `Checked ${formatRelativeTime(meta.lastVerifiedAt)}.` : 'Ready to verify.';
-        this.diskStatusNode.textContent = `${meta.folderName} · ${verified}`;
+        this.diskStatusNode.textContent = `${meta.folderName} ✓`;
         this.diskStatusNode.dataset.state = meta.lastVerifiedAt ? 'ready' : 'pending';
       }
     }
@@ -2109,10 +2294,9 @@ class PodcastStudioApp {
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
       if (this.cloud.hasDriveAccess()) {
-        this.setCloudMessage('drive', 'Google Drive linked. Recordings will upload automatically.', 'success');
+        this.setCloudMessage('drive', 'Google Drive connected. Guests can now record directly to Drive.', 'success');
         const folder = this.session?.GDRIVE_FOLDERNAME || null;
         markCloudLinked('drive', { folder });
-        await this.flushPendingDriveUploads();
       } else {
         this.setCloudMessage('drive', 'Check your popup blocker or try again.', 'warn');
         markCloudUnlinked('drive');
@@ -2189,6 +2373,190 @@ class PodcastStudioApp {
     return new AudioCtx();
   }
 
+  attachIcecastEvents() {
+    if (!this.icecastPublisher) {
+      return;
+    }
+    this.icecastPublisher.addEventListener('status', (event) => {
+      const detail = event.detail || {};
+      const state = detail.state === 'live' ? 'ready' : detail.state === 'connecting' ? 'pending' : detail.state || 'idle';
+      this.icecastLive = state === 'ready' || state === 'pending';
+      this.setIcecastStatus(detail.message || 'Icecast idle.', state);
+      this.updateIcecastUI();
+      this.updateReadinessSummary();
+    });
+    this.icecastPublisher.addEventListener('progress', (event) => {
+      const detail = event.detail || {};
+      if (!this.icecastPublisher?.isLive()) {
+        return;
+      }
+      const elapsedSeconds = detail.startedAt ? Math.max(1, Math.round((Date.now() - detail.startedAt) / 1000)) : 0;
+      const bytes = detail.bytesSent || 0;
+      this.setIcecastStatus(`Live ${this.formatFileSize(bytes)}${elapsedSeconds ? ` / ${this.formatDuration(elapsedSeconds)}` : ''}`, 'ready');
+    });
+    this.icecastPublisher.addEventListener('error', (event) => {
+      const error = event.detail;
+      this.icecastLive = false;
+      this.setIcecastStatus(error?.message || 'Icecast publish failed.', 'error');
+      this.updateIcecastUI();
+      this.updateReadinessSummary();
+    });
+  }
+
+  getIcecastMixParticipants() {
+    const participants = [];
+    Object.entries(this.session?.rpcs || {}).forEach(([uuid, peer]) => {
+      const stream = peer?.streamSrc || peer?.stream || peer?.videoElement?.srcObject || null;
+      if (!stream || !stream.getAudioTracks?.().length) {
+        return;
+      }
+      participants.push({
+        uuid,
+        label: peer.label || peer.streamID || uuid,
+        stream,
+        streamID: peer.streamID || uuid,
+        role: 'remote',
+      });
+    });
+    this.virtualParticipants.forEach((participant) => {
+      if (participant?.stream?.getAudioTracks?.().length) {
+        participants.push({ ...participant });
+      }
+    });
+    return participants;
+  }
+
+  collectIcecastSettingsFromForm() {
+    const targetUrl = (this.icecastTargetInput?.value || '').trim();
+    const username = (this.icecastUsernameInput?.value || 'source').trim() || 'source';
+    const password = this.icecastPasswordInput?.value || '';
+    const mimeType = this.icecastMimeSelect?.value || ICECAST_MIME_OPTIONS[0].value;
+    const isPublic = Boolean(this.icecastPublicInput?.checked);
+    const name = (this.icecastNameInput?.value || '').trim();
+    const genre = (this.icecastGenreInput?.value || '').trim();
+    return {
+      targetUrl,
+      username,
+      password,
+      mimeType,
+      public: isPublic,
+      name,
+      genre,
+    };
+  }
+
+  persistIcecastSettingsFromForm() {
+    writeIcecastSettings(this.collectIcecastSettingsFromForm());
+  }
+
+  readIcecastConfigFromForm() {
+    const storedSettings = this.collectIcecastSettingsFromForm();
+    const relayUrl = resolveIcecastRelayUrl(storedSettings);
+    const relayToken = resolveIcecastRelayToken();
+    writeIcecastSettings(storedSettings);
+    return {
+      relayUrl,
+      targetUrl: storedSettings.targetUrl,
+      username: storedSettings.username,
+      password: storedSettings.password,
+      relayToken,
+      mimeType: storedSettings.mimeType,
+      metadata: {
+        name: storedSettings.name || 'VDO.Ninja Live',
+        genre: storedSettings.genre || 'Live',
+        public: storedSettings.public,
+      },
+    };
+  }
+
+  setIcecastStatus(message, state = 'idle') {
+    if (!this.icecastStatusNode) {
+      return;
+    }
+    this.icecastStatusNode.textContent = message || 'Idle';
+    this.icecastStatusNode.dataset.state = state;
+  }
+
+  updateIcecastUI() {
+    const live = Boolean(this.icecastPublisher?.isLive());
+    this.icecastLive = live;
+    if (this.icecastButton) {
+      this.icecastButton.disabled = this.icecastBusy;
+      this.icecastButton.textContent = live ? 'Stop live' : this.icecastBusy ? 'Starting...' : 'Start live';
+      this.icecastButton.dataset.state = live ? 'enabled' : 'idle';
+    }
+    if (this.icecastSettingsButton) {
+      this.icecastSettingsButton.disabled = live || this.icecastBusy;
+      this.icecastSettingsButton.textContent = this.icecastSettingsOpen ? 'Hide settings' : 'Settings';
+      this.icecastSettingsButton.setAttribute('aria-expanded', this.icecastSettingsOpen ? 'true' : 'false');
+    }
+    if (this.icecastSettingsPanel) {
+      this.icecastSettingsPanel.hidden = !this.icecastSettingsOpen;
+    }
+    [
+      this.icecastTargetInput,
+      this.icecastUsernameInput,
+      this.icecastPasswordInput,
+      this.icecastMimeSelect,
+      this.icecastPublicInput,
+      this.icecastNameInput,
+      this.icecastGenreInput,
+    ].forEach((node) => {
+      if (node) {
+        node.disabled = live || this.icecastBusy;
+      }
+    });
+  }
+
+  toggleIcecastSettings() {
+    if (this.icecastPublisher?.isLive() || this.icecastBusy) {
+      return;
+    }
+    this.icecastSettingsOpen = !this.icecastSettingsOpen;
+    this.updateIcecastUI();
+  }
+
+  async handleIcecastToggle() {
+    if (!this.icecastPublisher || this.icecastBusy) {
+      return;
+    }
+    if (this.icecastPublisher.isLive()) {
+      this.icecastBusy = true;
+      this.updateIcecastUI();
+      this.setIcecastStatus('Stopping...', 'pending');
+      try {
+        await this.icecastPublisher.stop();
+      } catch (error) {
+        console.warn('Failed to stop Icecast publisher', error);
+        this.setIcecastStatus(error?.message || 'Stop failed.', 'error');
+      } finally {
+        this.icecastBusy = false;
+        this.icecastLive = false;
+        this.updateIcecastUI();
+        this.updateReadinessSummary();
+      }
+      return;
+    }
+    this.icecastBusy = true;
+    this.updateIcecastUI();
+    this.setIcecastStatus('Starting...', 'pending');
+    try {
+      await this.ensureAudioContextResumed();
+      this.icecastPublisher.setAudioContext(this.audioContext);
+      const config = this.readIcecastConfigFromForm();
+      await this.icecastPublisher.start(config);
+      this.icecastLive = true;
+    } catch (error) {
+      console.error('Failed to start Icecast publisher', error);
+      this.icecastLive = false;
+      this.setIcecastStatus(error?.message || 'Unable to start.', 'error');
+    } finally {
+      this.icecastBusy = false;
+      this.updateIcecastUI();
+      this.updateReadinessSummary();
+    }
+  }
+
   buildLayout() {
     if (document.getElementById(STUDIO_ROOT_ID)) {
       return;
@@ -2198,30 +2566,55 @@ class PodcastStudioApp {
 
     // Header
     const header = createElement('header', 'podcast-header');
+    const headerLeft = createElement('div', 'podcast-header__left');
     const title = createElement('h1', '', { text: 'Podcast Control Room' });
+    this.sessionInfo = createElement('div', 'podcast-header__room', { text: this.roomName || '' });
+    headerLeft.append(title, this.sessionInfo);
     const statusPill = createElement('div', 'podcast-status-pill');
     statusPill.innerHTML = '<span>Live-ready</span>';
-    header.append(title, statusPill);
+    header.append(headerLeft, statusPill);
 
     // Main layout
     const main = createElement('main', 'podcast-main');
 
-    // Left column (roster + markers)
+    // Left column (host input + roster + markers)
     const rosterColumn = createElement('div', 'podcast-roster');
+
+    // Host Input panel (director's mic)
+    const hostPanel = createElement('section', 'podcast-panel host-panel');
+    hostPanel.append(createElement('h2', '', { text: '🎙️ Host Input' }));
+    const hostControls = createElement('div', 'host-input-content');
+    this.hostMicButton = createElement('button', 'host-input-toggle', { type: 'button', text: 'Enable', title: 'Toggle local host microphone capture (optional).'});
+    this.hostMicButton.addEventListener('click', () => this.handleHostMicToggle());
+    this.hostMuteButton = createElement('button', 'host-mute-toggle', { type: 'button', text: '🔊 Mute', title: 'Mute/unmute the host mic track.' });
+    this.hostMuteButton.disabled = true;
+    this.hostMuteButton.addEventListener('click', () => this.handleHostMuteToggle());
+    this.hostMicStatusNode = createElement('div', 'host-input-status', { text: 'Idle' });
+    hostControls.append(this.hostMicButton, this.hostMuteButton, this.hostMicStatusNode);
+    this.hostMicErrorNode = createElement('div', 'host-input-error');
+    hostPanel.append(hostControls, this.hostMicErrorNode);
+
     const rosterPanel = createElement('section', 'podcast-panel');
-    rosterPanel.append(createElement('h2', '', { text: 'Talent Roster' }));
     this.rosterList = createElement('div', 'roster-list');
     rosterPanel.append(this.rosterList);
+    makeCollapsible(rosterPanel, 'Talent Roster', 'podcastStudio.collapse.roster');
 
     const markersPanel = createElement('section', 'podcast-panel');
-    markersPanel.append(createElement('h2', '', { text: 'Session Markers' }));
     this.markerLog = createElement('div', 'marker-log');
-    const emptyMarkers = createElement('div', 'empty-state', { text: 'Tap “Add Marker” to drop cue points during recording.' });
+    const emptyMarkers = createElement('div', 'empty-state', { text: 'Tap “Marker” to drop cue points during recording.' });
     emptyMarkers.dataset.empty = 'true';
     this.markerLog.append(emptyMarkers);
-    markersPanel.append(this.markerLog);
+    this.markerActions = createElement('div', 'cloud-sync-list__actions marker-actions');
+    this.markerActions.style.display = 'none';
+    this.markerExportButton = createElement('button', 'cloud-sync-list__button', { type: 'button', text: 'Export CSV', title: 'Download markers as a CSV file.' });
+    this.markerExportButton.addEventListener('click', () => this.exportMarkersCsv());
+    this.markerCopyButton = createElement('button', 'cloud-sync-list__button', { type: 'button', text: 'Copy CSV', title: 'Copy markers CSV to clipboard.' });
+    this.markerCopyButton.addEventListener('click', () => this.copyMarkersCsv());
+    this.markerActions.append(this.markerExportButton, this.markerCopyButton);
+    markersPanel.append(this.markerLog, this.markerActions);
+    makeCollapsible(markersPanel, 'Session Markers', 'podcastStudio.collapse.markers');
 
-    rosterColumn.append(rosterPanel, markersPanel);
+    rosterColumn.append(hostPanel, rosterPanel, markersPanel);
 
     // Right column (controls + timeline)
     const consoleColumn = createElement('div', 'podcast-console');
@@ -2230,7 +2623,6 @@ class PodcastStudioApp {
 
     const invitePanel = createElement('section', 'podcast-panel invite-panel');
     invitePanel.classList.add('console-grid__span-2');
-    invitePanel.append(createElement('h2', '', { text: 'Guest Invites' }));
     const inviteIntro = createElement('p', 'invite-copy', {
       text: 'Share a pro audio-ready link with guests. Tweak processing flags before copying.',
     });
@@ -2239,6 +2631,7 @@ class PodcastStudioApp {
       type: 'text',
       readonly: 'true',
       value: '',
+      title: 'Guest invite link (click to select).',
     });
     this.inviteLinkInput.addEventListener('focus', () => {
       try {
@@ -2247,22 +2640,26 @@ class PodcastStudioApp {
         console.warn('Invite link select failed', error);
       }
     });
-    this.inviteCopyButton = createElement('button', 'invite-link-copy', { type: 'button', text: 'Copy link' });
+    this.inviteCopyButton = createElement('button', 'invite-link-copy', { type: 'button', text: 'Copy link', title: 'Copy the guest invite link.' });
     this.inviteCopyButton.addEventListener('click', () => this.copyInviteLink());
     inviteLinkRow.append(this.inviteLinkInput, this.inviteCopyButton);
     this.inviteStatusNode = createElement('div', 'invite-status');
 
     const inviteOptions = createElement('div', 'invite-options');
     const optionDefs = [
+      { key: 'disableVideo', label: 'Disable video preview', defaultChecked: false },
       { key: 'proAudio', label: 'Enable pro audio (stereo, 256 kbps)', defaultChecked: true },
       { key: 'disableAec', label: 'Disable echo cancellation', defaultChecked: true },
       { key: 'disableDenoise', label: 'Disable noise reduction', defaultChecked: true },
       { key: 'disableAgc', label: 'Disable auto gain control', defaultChecked: true },
+      { key: 'guestRecordBackup', label: 'Guest-side audio record backup', defaultChecked: true },
     ];
     optionDefs.forEach((option) => {
       const optionLabel = createElement('label', 'invite-option');
       const checkbox = createElement('input', 'invite-option__checkbox', { type: 'checkbox' });
       checkbox.checked = option.defaultChecked;
+      checkbox.title = 'Applies to the generated guest link.';
+      optionLabel.title = option.label;
       checkbox.addEventListener('change', () => this.updateInviteLink());
       optionLabel.append(checkbox, createElement('span', 'invite-option__label', { text: option.label }));
       inviteOptions.append(optionLabel);
@@ -2270,77 +2667,139 @@ class PodcastStudioApp {
     });
 
     invitePanel.append(inviteIntro, inviteLinkRow, this.inviteStatusNode, inviteOptions);
+    makeCollapsible(invitePanel, 'Guest Invites', 'podcastStudio.collapse.invites');
 
     const sessionToolsPanel = createElement('section', 'podcast-panel session-tools');
     sessionToolsPanel.classList.add('console-grid__span-2');
     const sessionToolsGrid = createElement('div', 'session-tools__grid');
     sessionToolsPanel.append(sessionToolsGrid);
 
-    const hostCard = createElement('div', 'session-tool session-tool--host');
-    hostCard.append(createElement('h2', 'session-tool__title', { text: 'Host Input' }));
-    const hostControls = createElement('div', 'host-input-content');
-    this.hostMicButton = createElement('button', 'host-input-toggle', { text: 'Enable Host Mic' });
-    this.hostMicButton.addEventListener('click', () => this.handleHostMicToggle());
-    this.hostMicStatusNode = createElement('div', 'host-input-status', { text: 'Microphone idle' });
-    hostControls.append(this.hostMicButton, this.hostMicStatusNode);
-    this.hostMicErrorNode = createElement('div', 'host-input-error');
-    hostCard.append(hostControls, this.hostMicErrorNode);
-    sessionToolsGrid.append(hostCard);
-
     const controlCard = createElement('div', 'session-tool session-tool--control');
-    controlCard.append(createElement('h2', 'session-tool__title', { text: 'Session Control' }));
-    const transportStrip = createElement('div', 'transport-strip');
-    this.recordButton = createElement('button', '', { text: 'Arm & Record' });
-    this.recordButton.addEventListener('click', () => this.handleRecordToggle());
+    controlCard.append(createElement('h2', 'session-tool__title', { text: '⏺ Recording' }));
 
-    this.markerButton = createElement('button', '', { text: 'Add Marker' });
-    this.markerButton.disabled = true;
-    this.markerButton.addEventListener('click', () => this.addMarker());
+    this.recordingSummary = createElement('div', 'recording-summary');
+    this.captureSummaryNode = createElement('div', 'recording-summary__item', { text: 'Capture: Audio ISO' });
+    this.backupSummaryNode = createElement('div', 'recording-summary__item', { text: 'Backup: None' });
+    this.saveSummaryNode = createElement('div', 'recording-summary__item', { text: 'Save: Browser buffer only' });
+    this.recordingSummary.append(this.captureSummaryNode, this.backupSummaryNode, this.saveSummaryNode);
+    this.recordingSummary.style.display = 'none';
 
     const transportButtons = createElement('div', 'transport-buttons');
-    transportButtons.append(this.recordButton, this.markerButton);
-    this.sessionInfo = createElement('div', 'session-info', { text: 'Room: ' + (this.roomName || '—') });
-    transportStrip.append(transportButtons);
-    transportStrip.append(this.sessionInfo);
-    this.recordingStatusNode = createElement('div', 'session-recording-status', { text: 'Recording idle' });
+    this.recordButton = createElement('button', 'btn-record', { type: 'button', text: 'Start Recording', title: 'Start or stop ISO recording for this session.' });
+    this.recordButton.addEventListener('click', () => this.handleRecordToggle());
+    this.markerButton = createElement('button', 'btn-secondary', { type: 'button', text: 'Marker', title: 'Drop a cue marker at the current time.' });
+    this.markerButton.disabled = true;
+    this.markerButton.addEventListener('click', () => this.addMarker());
+    const captureSelectId = 'podcast-capture-mode';
+    const captureModeLabel = createElement('label', 'capture-mode-label', { text: 'Capture' });
+    captureModeLabel.setAttribute('for', captureSelectId);
+    this.captureModeSelect = createElement('select', 'capture-mode-select', { id: captureSelectId });
+    this.captureModeSelect.append(new Option('Audio only', 'audio'), new Option('Audio + Video', 'video'));
+    this.captureModeSelect.value = this.currentRecordingMode === 'video' ? 'video' : 'audio';
+    this.captureModeSelect.addEventListener('change', () => this.handleCaptureModeChange(this.captureModeSelect.value));
+    const captureWrap = createElement('div', 'capture-mode-wrap');
+    captureWrap.append(captureModeLabel, this.captureModeSelect);
+    transportButtons.append(captureWrap, this.recordButton);
+    transportButtons.append(this.markerButton);
+
+    this.recordShowButton = createElement('button', 'record-group-button', { type: 'button', text: '🎬 Record Group', title: 'Open a popup window with the combined scene for screen recording.' });
+    this.recordShowButton.addEventListener('click', () => this.openRecordShowWindow());
+
+    this.recordingStatusNode = createElement('div', 'session-recording-status', { text: 'Idle' });
     this.recordingStatusNode.dataset.state = 'idle';
-    transportStrip.append(this.recordingStatusNode);
-    controlCard.append(transportStrip);
+    const statusRow = createElement('div', 'recording-status-row');
+    statusRow.append(this.recordingStatusNode);
+
+    const destLightsRow = createElement('div', 'destination-lights');
+    const createDestLight = (key, label) => {
+      const el = createElement('div', 'dest-light');
+      const dot = createElement('span', 'dest-light__dot');
+      const textWrap = createElement('div', 'dest-light__text');
+      const name = createElement('span', 'dest-light__name', { text: label });
+      const status = createElement('span', 'dest-light__status');
+      textWrap.append(name, status);
+      el.append(dot, textWrap);
+      el.dataset.state = 'gray';
+      this.destinationLights[key] = { el, dot, status };
+      return el;
+    };
+
+    const hostGroup = createElement('div', 'dest-group');
+    hostGroup.append(createElement('div', 'dest-group__label', { text: 'You record' }));
+    const hostLights = createElement('div', 'dest-group__lights');
+    hostLights.append(createDestLight('download', 'Download'));
+    hostLights.append(createDestLight('dropbox', 'Dropbox'));
+    if (STUDIO_DISK_FEATURE_FLAG) {
+      hostLights.append(createDestLight('disk', 'Local folder'));
+    }
+    hostGroup.append(hostLights);
+
+    const guestGroup = createElement('div', 'dest-group');
+    guestGroup.append(createElement('div', 'dest-group__label', { text: 'Guests record' }));
+    const guestLights = createElement('div', 'dest-group__lights');
+    guestLights.append(createDestLight('drive', 'Google Drive'));
+    guestGroup.append(guestLights, createElement('div', 'dest-group__hint', { text: 'Guests can also record locally — see Guest Invites' }));
+
+    destLightsRow.append(hostGroup, createElement('div', 'dest-group-divider'), guestGroup);
+    const recordGroupRow = createElement('div', 'record-group-row');
+    recordGroupRow.append(this.recordShowButton);
+    controlCard.append(this.recordingSummary, destLightsRow, transportButtons, statusRow, recordGroupRow);
     sessionToolsGrid.append(controlCard);
 
-    const cloudCard = createElement('div', 'session-tool session-tool--cloud');
-    cloudCard.append(createElement('h2', 'session-tool__title', { text: 'Cloud Sync' }));
-    const cloudList = createElement('div', 'cloud-sync-list');
-    const driveRow = createElement('div', 'cloud-sync-list__row');
-    driveRow.append(createElement('div', 'cloud-sync-list__label', { text: 'Google Drive' }));
-    const driveActions = createElement('div', 'cloud-sync-list__actions');
-    this.cloudLinkButtons.drive = createElement('button', 'cloud-sync-list__button', { text: 'Link Google Drive' });
+    // ISO Recording Configuration - unified destinations section
+    const isoConfigCard = createElement('div', 'session-tool session-tool--iso-config');
+    isoConfigCard.append(createElement('h2', 'session-tool__title', { text: '💾 Recording settings' }));
+    const isoConfigList = createElement('div', 'iso-config-list');
+
+
+    this.guestBackupRow = createElement('div', 'iso-config-row');
+    this.guestBackupRow.append(createElement('div', 'iso-config-row__label', { text: 'Guest backup' }));
+    const guestBackupActions = createElement('div', 'iso-config-row__actions');
+    this.guestBackupButton = createElement('button', 'iso-config-row__button iso-config-row__button--backup', {
+      type: 'button',
+      text: 'Enable guest backup',
+      title: 'Ask every connected guest to self-record directly to your linked Google Drive.',
+    });
+    this.guestBackupButton.addEventListener('click', () => this.handleGuestBackupToggle());
+    this.guestBackupStatusNode = createElement('span', 'iso-config-row__status', { text: 'No guests connected' });
+    guestBackupActions.append(this.guestBackupButton, this.guestBackupStatusNode);
+    this.guestBackupRow.append(guestBackupActions);
+    this.guestBackupHint = null;
+    this.guestBackupRow.style.display = 'none';
+    isoConfigList.append(this.guestBackupRow);
+
+    // Google Drive row
+    const driveRow = createElement('div', 'iso-config-row');
+    driveRow.append(createElement('div', 'iso-config-row__label', { text: 'Google Drive' }));
+    const driveActions = createElement('div', 'iso-config-row__actions');
+    this.cloudLinkButtons.drive = createElement('button', 'iso-config-row__button', { type: 'button', text: 'Connect', title: 'Connect Google Drive to upload recordings automatically after each session.' });
     this.cloudLinkButtons.drive.addEventListener('click', () => this.handleDriveLink());
     this.cloudLinkButtons.drive.dataset.state = 'idle';
-    this.cloudLinkStatusNodes.drive = createElement('span', 'cloud-sync-list__status', { text: 'Not linked' });
+    this.cloudLinkStatusNodes.drive = createElement('span', 'iso-config-row__status', { text: 'Not connected' });
     this.cloudLinkStatusNodes.drive.dataset.state = 'idle';
     driveActions.append(this.cloudLinkButtons.drive, this.cloudLinkStatusNodes.drive);
     driveRow.append(driveActions);
-    this.cloudLinkMessages.drive = createElement('div', 'cloud-sync-list__hint');
+    this.cloudLinkMessages.drive = createElement('div', 'iso-config-row__hint');
     this.cloudLinkMessages.drive.dataset.variant = '';
-    const driveMessageText = createElement('span', 'cloud-sync-list__hint-text');
+    const driveMessageText = createElement('span', 'iso-config-row__hint-text');
     this.cloudLinkMessages.drive.append(driveMessageText);
     this.cloudLinkMessageTextNodes.drive = driveMessageText;
-    cloudList.append(driveRow, this.cloudLinkMessages.drive);
+    isoConfigList.append(driveRow, this.cloudLinkMessages.drive);
 
-    const dropboxRow = createElement('div', 'cloud-sync-list__row');
-    dropboxRow.append(createElement('div', 'cloud-sync-list__label', { text: 'Dropbox' }));
-    const dropboxActions = createElement('div', 'cloud-sync-list__actions');
-    this.cloudLinkButtons.dropbox = createElement('button', 'cloud-sync-list__button', { text: 'Link Dropbox' });
+    // Dropbox row
+    const dropboxRow = createElement('div', 'iso-config-row');
+    dropboxRow.append(createElement('div', 'iso-config-row__label', { text: 'Dropbox' }));
+    const dropboxActions = createElement('div', 'iso-config-row__actions');
+    this.cloudLinkButtons.dropbox = createElement('button', 'iso-config-row__button', { type: 'button', text: 'Connect', title: 'Connect Dropbox to upload recordings automatically after each session.' });
     this.cloudLinkButtons.dropbox.addEventListener('click', () => this.handleDropboxLink());
     this.cloudLinkButtons.dropbox.dataset.state = 'idle';
-    this.cloudLinkStatusNodes.dropbox = createElement('span', 'cloud-sync-list__status', { text: 'Not linked' });
+    this.cloudLinkStatusNodes.dropbox = createElement('span', 'iso-config-row__status', { text: 'Not connected' });
     this.cloudLinkStatusNodes.dropbox.dataset.state = 'idle';
     dropboxActions.append(this.cloudLinkButtons.dropbox, this.cloudLinkStatusNodes.dropbox);
     dropboxRow.append(dropboxActions);
-    this.cloudLinkMessages.dropbox = createElement('div', 'cloud-sync-list__hint');
+    this.cloudLinkMessages.dropbox = createElement('div', 'iso-config-row__hint');
     this.cloudLinkMessages.dropbox.dataset.variant = '';
-    const dropboxMessageText = createElement('span', 'cloud-sync-list__hint-text');
+    const dropboxMessageText = createElement('span', 'iso-config-row__hint-text');
     this.cloudLinkMessages.dropbox.append(dropboxMessageText);
     this.cloudLinkMessageTextNodes.dropbox = dropboxMessageText;
     const tokenFieldId = 'podcast-dropbox-token';
@@ -2355,6 +2814,7 @@ class PodcastStudioApp {
       spellcheck: 'false',
       autocapitalize: 'none',
       autocomplete: 'off',
+      title: 'Fallback: paste a Dropbox token if the Link popup is unavailable.',
     });
     dropboxTokenRow.append(tokenLabel, this.dropboxTokenInput);
     const dropboxGuideRow = createElement('div', 'cloud-sync-token__guide');
@@ -2364,75 +2824,186 @@ class PodcastStudioApp {
       href: DROPBOX_GUIDE_URL,
       target: '_blank',
       rel: 'noopener',
+      title: 'Open the Dropbox setup guide in a new tab.',
     });
     dropboxGuideRow.append('Need a token? ', guideLink);
     this.cloudLinkMessages.dropbox.append(dropboxTokenRow, dropboxGuideRow);
     this.hideDropboxTokenFallback();
-    cloudList.append(dropboxRow, this.cloudLinkMessages.dropbox);
-    const cloudSummary = createElement('div', 'cloud-sync-summary');
-    this.cloudSummaryNode = createElement('div', 'cloud-sync-summary__item', { text: 'Cloud uploads: pending' });
-    this.cloudSummaryNode.dataset.state = 'pending';
-    const diskSummaryText = STUDIO_DISK_FEATURE_FLAG
-      ? 'Disk capture: checking browser support…'
-      : 'Disk capture disabled (?studioiso=0)';
-    this.diskSummaryNode = createElement('div', 'cloud-sync-summary__item', { text: diskSummaryText });
-    this.diskSummaryNode.dataset.state = STUDIO_DISK_FEATURE_FLAG ? 'pending' : 'disabled';
-    cloudSummary.append(this.cloudSummaryNode, this.diskSummaryNode);
+    isoConfigList.append(dropboxRow, this.cloudLinkMessages.dropbox);
 
-    const cloudProgress = createElement('div', 'cloud-sync-progress');
-    ['drive', 'dropbox'].forEach((service) => {
-      const label = this.describeService(service);
-      const item = createElement('div', 'cloud-sync-progress__item', { text: `${label} uploads idle` });
-      item.dataset.service = service;
-      item.dataset.state = 'idle';
-      cloudProgress.append(item);
-      this.cloudProgressNodes[service] = item;
-    });
-
-    cloudCard.append(cloudList, cloudSummary, cloudProgress);
-    sessionToolsGrid.append(cloudCard);
-
+    // Local Disk row
     if (STUDIO_DISK_FEATURE_FLAG) {
-      const diskCard = createElement('div', 'session-tool session-tool--disk');
-      diskCard.append(createElement('h2', 'session-tool__title', { text: 'Local Disk Capture' }));
       const diskSupported = typeof window.showDirectoryPicker === 'function';
-      const diskList = createElement('div', 'cloud-sync-list cloud-sync-list--disk');
-      this.diskControls = diskList;
-      this.diskToggleButton = createElement('button', 'transport-disk__toggle', {
+      const diskRow = createElement('div', 'iso-config-row');
+      diskRow.append(createElement('div', 'iso-config-row__label', { text: 'Local Disk' }));
+      const diskActions = createElement('div', 'iso-config-row__actions');
+      this.diskControls = diskActions;
+      this.diskToggleButton = createElement('button', 'iso-config-row__button', {
         type: 'button',
-        text: 'Setup local disk recording',
+        text: 'Arm',
+        title: 'Arm/disarm recording ISO files to local disk.',
       });
       this.diskToggleButton.addEventListener('click', () => this.handleDiskToggle());
-      this.diskFolderButton = createElement('button', 'transport-disk__folder', {
+      this.diskFolderButton = createElement('button', 'iso-config-row__button iso-config-row__button--secondary', {
         type: 'button',
-        text: diskSupported ? 'Choose folder' : 'Not supported',
+        text: diskSupported ? 'Folder' : 'N/A',
+        title: diskSupported ? 'Choose the destination folder for disk recording.' : 'Local disk recording is not supported in this browser.',
       });
       this.diskFolderButton.disabled = !diskSupported;
       if (diskSupported) {
         this.diskFolderButton.addEventListener('click', () => this.handleDiskFolderSelection());
       }
-      this.diskStatusNode = createElement('div', 'transport-disk__status', {
-        text: diskSupported ? 'Folder not selected' : 'File System Access API unavailable',
+      this.diskStatusNode = createElement('span', 'iso-config-row__status', {
+        text: diskSupported ? 'No folder' : 'Not supported',
       });
-      diskList.append(this.diskToggleButton, this.diskFolderButton, this.diskStatusNode);
-      const diskHintWrapper = createElement('div', 'transport-disk transport-disk--panel');
-      const diskHint = createElement('p', 'transport-disk__hint', {
-        text: diskSupported
-          ? 'Select a folder per session; browsers may prompt again if permissions expire.'
-          : 'Use Chromium-based browsers for File System Access support.',
-      });
-      diskHintWrapper.append(diskHint);
-      diskCard.append(diskList, diskHintWrapper);
-      sessionToolsGrid.append(diskCard);
+      diskActions.append(this.diskToggleButton, this.diskFolderButton, this.diskStatusNode);
+      diskRow.append(diskActions);
+      isoConfigList.append(diskRow);
       this.updateDiskRecordingUI();
     }
 
+    const icecastSettings = readIcecastSettings();
+    const icecastRow = createElement('div', 'iso-config-row iso-config-row--icecast');
+    icecastRow.append(createElement('div', 'iso-config-row__label', { text: 'Icecast' }));
+    const icecastActions = createElement('div', 'iso-config-row__actions');
+    this.icecastButton = createElement('button', 'iso-config-row__button', {
+      type: 'button',
+      text: 'Start live',
+      title: 'Publish the mixed studio audio to an Icecast-compatible source endpoint.',
+    });
+    this.icecastButton.addEventListener('click', () => this.handleIcecastToggle());
+    this.icecastSettingsButton = createElement('button', 'iso-config-row__button iso-config-row__button--secondary', {
+      type: 'button',
+      text: 'Settings',
+      title: 'Show Icecast publishing settings.',
+      'aria-expanded': 'false',
+    });
+    this.icecastSettingsButton.addEventListener('click', () => this.toggleIcecastSettings());
+    this.icecastStatusNode = createElement('span', 'iso-config-row__status', { text: 'Idle' });
+    this.icecastStatusNode.dataset.state = 'idle';
+    icecastActions.append(this.icecastButton, this.icecastSettingsButton, this.icecastStatusNode);
+    icecastRow.append(icecastActions);
+    isoConfigList.append(icecastRow);
+
+    this.icecastSettingsOpen = false;
+    const icecastPanel = createElement('div', 'iso-config-advanced icecast-config');
+    icecastPanel.hidden = true;
+    this.icecastSettingsPanel = icecastPanel;
+    const icecastBody = createElement('div', 'iso-config-advanced__body icecast-config__body');
+    const createIcecastField = (labelText, input, hintText = '') => {
+      const label = createElement('label', 'icecast-config__field');
+      label.append(createElement('span', 'icecast-config__label', { text: labelText }), input);
+      if (hintText) {
+        label.append(createElement('span', 'icecast-config__hint', { text: hintText }));
+      }
+      return label;
+    };
+    this.icecastTargetInput = createElement('input', 'icecast-config__input', {
+      type: 'url',
+      placeholder: 'https://radio.example.com/radio/8000/',
+      value: icecastSettings.targetUrl || '',
+      autocomplete: 'off',
+      spellcheck: 'false',
+      title: 'Icecast or AzuraCast source ingest URL, not the public listener URL.',
+    });
+    this.icecastUsernameInput = createElement('input', 'icecast-config__input', {
+      type: 'text',
+      placeholder: 'source',
+      value: icecastSettings.username || 'source',
+      autocomplete: 'username',
+      spellcheck: 'false',
+      title: 'Icecast source username.',
+    });
+    this.icecastPasswordInput = createElement('input', 'icecast-config__input', {
+      type: 'password',
+      placeholder: 'Source password',
+      value: icecastSettings.password || '',
+      autocomplete: 'off',
+      autocapitalize: 'none',
+      spellcheck: 'false',
+      title: 'Icecast source password. Stored locally in this browser with the Icecast settings.',
+    });
+    this.icecastMimeSelect = createElement('select', 'icecast-config__input icecast-config__select', {
+      title: 'Audio container sent to Icecast.',
+    });
+    ICECAST_MIME_OPTIONS.forEach((option) => {
+      this.icecastMimeSelect.append(new Option(option.label, option.value));
+    });
+    this.icecastMimeSelect.value = ICECAST_MIME_OPTIONS.some((option) => option.value === icecastSettings.mimeType)
+      ? icecastSettings.mimeType
+      : DEFAULT_ICECAST_MIME_TYPE;
+    this.icecastNameInput = createElement('input', 'icecast-config__input', {
+      type: 'text',
+      placeholder: 'VDO.Ninja Live',
+      value: icecastSettings.name || '',
+      autocomplete: 'off',
+      title: 'Optional stream name shown by Icecast.',
+    });
+    this.icecastGenreInput = createElement('input', 'icecast-config__input', {
+      type: 'text',
+      placeholder: 'Live',
+      value: icecastSettings.genre || '',
+      autocomplete: 'off',
+      title: 'Optional stream genre shown by Icecast.',
+    });
+    const icecastToggles = createElement('div', 'icecast-config__toggles');
+    const publicLabel = createElement('label', 'icecast-config__toggle');
+    this.icecastPublicInput = createElement('input', '', { type: 'checkbox' });
+    this.icecastPublicInput.checked = Boolean(icecastSettings.public);
+    publicLabel.append(this.icecastPublicInput, createElement('span', '', { text: 'Public listing' }));
+    icecastToggles.append(publicLabel);
+
+    icecastBody.append(
+      createIcecastField('Source URL', this.icecastTargetInput, 'Recommended: allow VDO.Ninja in the Icecast/AzuraCast CORS settings for the best direct publishing path.'),
+      createIcecastField('Username', this.icecastUsernameInput),
+      createIcecastField('Password', this.icecastPasswordInput),
+      createIcecastField('Format', this.icecastMimeSelect),
+      createIcecastField('Name', this.icecastNameInput),
+      createIcecastField('Genre', this.icecastGenreInput),
+      icecastToggles,
+    );
+    [
+      this.icecastTargetInput,
+      this.icecastUsernameInput,
+      this.icecastPasswordInput,
+      this.icecastMimeSelect,
+      this.icecastPublicInput,
+      this.icecastNameInput,
+      this.icecastGenreInput,
+    ].forEach((node) => {
+      node.addEventListener('input', () => this.persistIcecastSettingsFromForm());
+      node.addEventListener('change', () => this.persistIcecastSettingsFromForm());
+    });
+    icecastPanel.append(icecastBody);
+    isoConfigList.append(icecastPanel);
+
+    // Summary section
+    this.isoSummary = createElement('div', 'iso-config-summary');
+    this.cloudSummaryNode = createElement('div', 'iso-config-summary__item', { text: 'Status: checking...' });
+    this.cloudSummaryNode.dataset.state = 'pending';
+    const serviceProgress = createElement('div', 'iso-config-summary__services');
+    this.cloudProgressNodes.drive = createElement('div', 'iso-config-summary__item iso-config-summary__item--service', {
+      text: 'Drive uploads idle',
+    });
+    this.cloudProgressNodes.drive.dataset.state = 'idle';
+    this.cloudProgressNodes.dropbox = createElement('div', 'iso-config-summary__item iso-config-summary__item--service', {
+      text: 'Dropbox uploads idle',
+    });
+    this.cloudProgressNodes.dropbox.dataset.state = 'idle';
+    serviceProgress.append(this.cloudProgressNodes.drive, this.cloudProgressNodes.dropbox);
+    this.isoSummary.append(this.cloudSummaryNode, serviceProgress);
+    this.isoSummary.style.display = 'none';
+
+    isoConfigCard.append(isoConfigList, this.isoSummary);
+    sessionToolsGrid.append(isoConfigCard);
+    makeCollapsible(sessionToolsPanel, 'Recording Controls', 'podcastStudio.collapse.recording');
+
     const timelinePanel = createElement('section', 'podcast-panel timeline-shell');
     timelinePanel.classList.add('console-grid__span-2');
-    timelinePanel.append(createElement('h2', '', { text: 'Timeline & Outputs' }));
     this.outputsContainer = createElement('div', 'timeline-surface');
     timelinePanel.append(this.outputsContainer);
     this.showOutputsMessage('Recordings and cue points will appear here.');
+    makeCollapsible(timelinePanel, 'Timeline & Outputs', 'podcastStudio.collapse.timeline');
 
     const chatPanel = createElement('section', 'podcast-panel chat-panel');
     chatPanel.dataset.collapsed = 'false';
@@ -2440,12 +3011,13 @@ class PodcastStudioApp {
     const chatHeaderRow = createElement('div', 'chat-panel__header');
     const chatTitle = createElement('h2', '', { text: 'Control Room Chat' });
     const chatActions = createElement('div', 'chat-panel__actions');
-    this.chatPopoutButton = createElement('button', 'chat-panel__action', { type: 'button', text: 'Pop out' });
+    this.chatPopoutButton = createElement('button', 'chat-panel__action', { type: 'button', text: 'Pop out', title: 'Open chat in a separate window.' });
     this.chatPopoutButton.addEventListener('click', () => this.handleChatPopout());
-    this.chatCollapseButton = createElement('button', 'chat-panel__action chat-panel__toggle', {
+    this.chatCollapseButton = createElement('button', 'panel-collapse-toggle', {
       type: 'button',
-      text: 'Hide chat',
+      text: '−',
     });
+    this.chatCollapseButton.title = 'Collapse section';
     this.chatCollapseButton.setAttribute('aria-expanded', 'true');
     this.chatCollapseButton.addEventListener('click', () => this.toggleChatPanel());
     chatActions.append(this.chatPopoutButton, this.chatCollapseButton);
@@ -2529,7 +3101,7 @@ class PodcastStudioApp {
     // Footer
     const footer = createElement('footer', 'podcast-footer');
     footer.innerHTML = `
-      <div>Powered by VDO.Ninja • Low-latency P2P backbone intact</div>
+      <div>Powered by VDO.Ninja • Low-latency P2P backbone intact • <span class="podcast-help-link" id="podcast-help-link" role="button" tabindex="0">Guide</span></div>
       <div class="cloud-status">
         <span id="podcast-cloud-drive">${this.cloud?.hasDriveAccess() ? 'Google Drive linked' : 'Drive link pending'}</span>
         <span id="podcast-cloud-dropbox">${this.cloud?.hasDropboxAccess() ? 'Dropbox linked' : 'Dropbox link pending'}</span>
@@ -2538,6 +3110,18 @@ class PodcastStudioApp {
 
     root.append(header, main, footer);
     document.body.appendChild(root);
+
+    // Help link click handler (must be after appendChild)
+    const helpLink = document.getElementById('podcast-help-link');
+    if (helpLink) {
+      helpLink.addEventListener('click', () => this.openHelpModal());
+      helpLink.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          this.openHelpModal();
+        }
+      });
+    }
 
     this.driveStatusNode = document.getElementById('podcast-cloud-drive');
     this.dropboxStatusNode = document.getElementById('podcast-cloud-dropbox');
@@ -2583,7 +3167,8 @@ class PodcastStudioApp {
       this.chatPanel.dataset.collapsed = this.chatCollapsed ? 'true' : 'false';
     }
     if (this.chatCollapseButton) {
-      this.chatCollapseButton.textContent = this.chatCollapsed ? 'Show chat' : 'Hide chat';
+      this.chatCollapseButton.textContent = this.chatCollapsed ? '+' : '−';
+      this.chatCollapseButton.title = this.chatCollapsed ? 'Expand section' : 'Collapse section';
       this.chatCollapseButton.setAttribute('aria-expanded', this.chatCollapsed ? 'false' : 'true');
     }
     if (this.chatCollapsedHint) {
@@ -2601,8 +3186,224 @@ class PodcastStudioApp {
     }
   }
 
+  getRecordingModeOptions(mode = this.currentRecordingMode) {
+    const videoMode = mode === 'video';
+    return {
+      includeVideo: videoMode,
+      includeScreenshares: videoMode,
+    };
+  }
+
+  handleCaptureModeChange(mode) {
+    const normalized = writeCaptureMode(mode);
+    this.currentRecordingMode = normalized;
+    if (this.captureModeSelect && this.captureModeSelect.value !== normalized) {
+      this.captureModeSelect.value = normalized;
+    }
+    this.updateRecordingButtons();
+    this.updateReadinessSummary();
+  }
+
+  getBackupParticipants() {
+    return collectParticipants(this.session).filter((participant) => participant?.uuid);
+  }
+
+  getGuestBackupParticipantState(uuid) {
+    const legacyButton = this.findLegacyDriveButton(uuid);
+    const pressed = Boolean(legacyButton?.classList?.contains('pressed'));
+    const snapshot = this.driveProgressSnapshots.get(uuid);
+    const heartbeat = this.isDriveRecorderHeartbeatActive(uuid);
+    const status = this.rosterDriveStatuses.get(uuid)?.dataset?.state || 'idle';
+    const requested = pressed || heartbeat || Boolean(snapshot) || this.driveRequestTimers.has(uuid) || status === 'pending' || status === 'uploading';
+    const confirmed = heartbeat || Boolean(snapshot);
+    return {
+      uuid,
+      pressed,
+      snapshot,
+      heartbeat,
+      status,
+      requested,
+      confirmed,
+      error: status === 'error',
+    };
+  }
+
+  getGuestBackupSnapshot() {
+    const participants = this.getBackupParticipants().map((participant) => ({
+      participant,
+      ...this.getGuestBackupParticipantState(participant.uuid),
+    }));
+    const total = participants.length;
+    const requested = participants.filter((entry) => entry.requested).length;
+    const confirmed = participants.filter((entry) => entry.confirmed).length;
+    const errors = participants.filter((entry) => entry.error).length;
+    return {
+      participants,
+      total,
+      requested,
+      confirmed,
+      pending: Math.max(requested - confirmed, 0),
+      errors,
+      linked: Boolean(this.cloud?.hasDriveAccess()),
+    };
+  }
+
+  getGuestBackupCompactLabel() {
+    const snapshot = this.getGuestBackupSnapshot();
+    if (!snapshot.total) {
+      return 'No guests';
+    }
+    if (!snapshot.requested) {
+      return 'No live backup';
+    }
+    return `Guest backup ${snapshot.confirmed}/${snapshot.total}`;
+  }
+
+  describeCaptureMode(mode = this.currentRecordingMode) {
+    return mode === 'video' ? 'Audio + Video ISO' : 'Audio ISO';
+  }
+
+  describeSaveTargetSummary() {
+    const driveActive = Boolean(this.cloud?.hasDriveAccess());
+    const dropboxActive = Boolean(this.cloud?.hasDropboxAccess());
+    const diskMeta = readDiskRecordingState();
+    const saveTargets = [];
+    if (STUDIO_DISK_FEATURE_FLAG && diskMeta.enabled && diskMeta.folderName) {
+      saveTargets.push(`Local folder (${diskMeta.folderName})`);
+    }
+    if (driveActive) {
+      saveTargets.push('Drive');
+    }
+    if (dropboxActive) {
+      saveTargets.push('Dropbox');
+    }
+    if (!saveTargets.length) {
+      return 'Browser buffer only';
+    }
+    return `After stop -> ${saveTargets.join(' + ')}`;
+  }
+
+  countEstimatedRecordingTracks() {
+    const recordingOptions = this.getRecordingModeOptions(this.currentRecordingMode);
+    let count = 0;
+    this.getBackupParticipants().forEach((participant) => {
+      const stream = this.session?.rpcs?.[participant.uuid]?.streamSrc;
+      const audioTracks = stream?.getAudioTracks?.() || [];
+      const videoTracks = stream?.getVideoTracks?.() || [];
+      count += audioTracks.length;
+      if (recordingOptions.includeVideo) {
+        count += videoTracks.length;
+      }
+    });
+    this.getAdditionalRecordingParticipants().forEach((participant) => {
+      const stream = participant?.stream;
+      count += stream?.getAudioTracks?.().length || 0;
+      if (recordingOptions.includeVideo) {
+        count += stream?.getVideoTracks?.().length || 0;
+      }
+    });
+    return Math.max(count, this.outputIndicators?.size || 0);
+  }
+
+  refreshRecordingStatusLive() {
+    if (!this.recordingStatusNode) {
+      return;
+    }
+    if (!this.recording || !this.recordStartedAt) {
+      this.recordingStatusNode.textContent = this.recordingStatusBase || 'Idle';
+      this.recordingStatusNode.dataset.state = this.recordingStatusState || 'idle';
+      return;
+    }
+    const elapsed = this.formatDuration(Math.max(0, (Date.now() - this.recordStartedAt) / 1000));
+    const trackCount = this.countEstimatedRecordingTracks();
+    const backupLabel = this.getGuestBackupCompactLabel();
+    this.recordingStatusNode.textContent = `${elapsed} | ${trackCount} track${trackCount === 1 ? '' : 's'} | ${backupLabel}`;
+    this.recordingStatusNode.dataset.state = 'active';
+  }
+
+  startRecordingStatusTimer() {
+    this.stopRecordingStatusTimer();
+    this.refreshRecordingStatusLive();
+    this.recordingStatusTimer = setInterval(() => this.refreshRecordingStatusLive(), 1000);
+  }
+
+  stopRecordingStatusTimer() {
+    if (this.recordingStatusTimer) {
+      clearInterval(this.recordingStatusTimer);
+      this.recordingStatusTimer = null;
+    }
+  }
+
+  updateGuestBackupControls() {
+    if (!this.guestBackupButton || !this.guestBackupStatusNode) {
+      return;
+    }
+    const snapshot = this.getGuestBackupSnapshot();
+    if (this.guestBackupRow) {
+      const visible = snapshot.total > 0;
+      this.guestBackupRow.style.display = visible ? '' : 'none';
+      if (this.guestBackupHint) this.guestBackupHint.style.display = visible ? '' : 'none';
+    }
+    const linked = snapshot.linked;
+    const hasGuests = snapshot.total > 0;
+    const hasRequested = snapshot.requested > 0;
+    const allRequested = hasGuests && snapshot.requested === snapshot.total;
+    const hasPartial = linked && snapshot.requested > 0 && snapshot.requested < snapshot.total;
+    this.guestBackupButton.disabled = this.guestBackupBusy || !hasGuests || (!linked && !hasRequested);
+    this.guestBackupButton.dataset.state = allRequested ? 'enabled' : 'idle';
+    if (!hasGuests) {
+      this.guestBackupButton.textContent = 'Enable guest backup';
+      this.guestBackupButton.title = 'A guest must join before backup can be enabled.';
+      this.guestBackupStatusNode.textContent = 'No guests connected';
+      this.guestBackupStatusNode.dataset.state = 'idle';
+      return;
+    }
+    if (!linked && !hasRequested) {
+      this.guestBackupButton.textContent = 'Enable guest backup';
+      this.guestBackupButton.title = 'Link Google Drive first to enable guest backup.';
+      this.guestBackupStatusNode.textContent = 'Link Google Drive first';
+      this.guestBackupStatusNode.dataset.state = 'error';
+      return;
+    }
+    if (allRequested || (!linked && hasRequested)) {
+      this.guestBackupButton.textContent = 'Disable guest backup';
+      this.guestBackupButton.title = 'Stop guest-side backup recording for all connected guests.';
+    } else if (hasPartial) {
+      this.guestBackupButton.textContent = 'Enable missing backups';
+      this.guestBackupButton.title = 'Enable backup recording for guests not yet confirmed.';
+    } else {
+      this.guestBackupButton.textContent = 'Enable guest backup';
+      this.guestBackupButton.title = 'Ask every connected guest to self-record directly to your linked Google Drive.';
+    }
+    if (!snapshot.requested) {
+      this.guestBackupStatusNode.textContent = `Ready for ${snapshot.total} guest${snapshot.total === 1 ? '' : 's'}`;
+      this.guestBackupStatusNode.dataset.state = 'idle';
+    } else if (snapshot.confirmed === snapshot.total) {
+      this.guestBackupStatusNode.textContent = `${snapshot.confirmed}/${snapshot.total} confirmed`;
+      this.guestBackupStatusNode.dataset.state = 'ready';
+    } else {
+      this.guestBackupStatusNode.textContent = `${snapshot.confirmed}/${snapshot.total} confirmed`;
+      this.guestBackupStatusNode.dataset.state = snapshot.errors ? 'error' : 'pending';
+    }
+  }
+
+  updateRecordingButtons() {
+    if (this.recordButton) {
+      this.recordButton.classList.toggle('recording', this.recording);
+      this.recordButton.disabled = this.recordTransitioning;
+      this.recordButton.textContent = this.recording ? 'Stop Recording' : 'Start Recording';
+      this.recordButton.title = this.recording
+        ? 'Stop the current ISO recording.'
+        : `Start ${this.describeCaptureMode(this.currentRecordingMode)} capture.`;
+    }
+    if (this.captureModeSelect) {
+      this.captureModeSelect.disabled = this.recording;
+    }
+    this.updateGuestBackupControls();
+  }
+
   attachRecorderEvents() {
-    this.recorder.addEventListener('start', () => {
+    this.recorder.addEventListener('start', (event) => {
       if (this.abortUploadsController) {
         this.abortUploadsController.abort();
       }
@@ -2613,11 +3414,14 @@ class PodcastStudioApp {
       this.teardownSpectrograms();
       this.outputIndicators.clear();
       this.recording = true;
-      this.recordStartedAt = Date.now();
-      this.recordButton.classList.add('recording');
-      this.recordButton.textContent = 'Stop Recording';
+      this.recordTransitioning = false;
+      this.recordStartedAt = event?.detail?.startedAt || Date.now();
+      this.markers = [];
+      this.renderMarkers();
+      this.scheduleAutoSyncMarker();
+      this.updateRecordingButtons();
       this.markerButton.disabled = false;
-      this.showOutputsMessage('Recording… tracks will appear as audio arrives.');
+      this.showOutputsMessage('Recording… tracks will appear as media arrives.');
       this.updateHostMicUI();
       this.setUploadProgressPending(true);
       if (this.recordingPlan?.sync) {
@@ -2626,9 +3430,14 @@ class PodcastStudioApp {
           highRes: snapshotHighResClock(),
         };
       }
-      this.logRecordingEvent('record:start', { sessionId: this.recordingSessionId });
+      this.logRecordingEvent('record:start', { sessionId: this.recordingSessionId, mode: this.currentRecordingMode });
       this.updateRecordingPlanStatus('started', { events: this.recordingPlan?.events || [] });
-      this.setRecordingStatus('Recording in progress', 'active');
+      this.setRecordingStatus(
+        this.currentRecordingMode === 'video' ? 'Recording audio + video ISOs' : 'Recording audio ISOs',
+        'active',
+      );
+      if (this.recordingSummary) this.recordingSummary.style.display = '';
+      this.startRecordingStatusTimer();
     });
 
     this.recorder.addEventListener('chunk', (event) => {
@@ -2667,6 +3476,34 @@ class PodcastStudioApp {
       this.attachSpectrogram(key, indicator, participant, trackType, channelIndex, meter);
     });
 
+    this.recorder.addEventListener('participant-added', (event) => {
+      const { participant, startOffsetSeconds } = event.detail || {};
+      if (!participant) {
+        return;
+      }
+      const annotateLateJoin = (trackType, trackIndex) => {
+        const key = this.buildTrackKey(participant.uuid, trackType, trackIndex);
+        if (key) {
+          const indicator = this.ensureOutputIndicator(key, participant, trackType, trackIndex);
+          if (indicator?.badge) {
+            indicator.badge.textContent = 'Late join';
+            indicator.badge.title = `Joined ${startOffsetSeconds?.toFixed(1) || '?'}s into recording`;
+          }
+        }
+      };
+      const audioTracks = participant.stream?.getAudioTracks?.() || [];
+      if (audioTracks.length) {
+        audioTracks.forEach((_track, index) => annotateLateJoin('audio', index));
+      }
+      const videoTracks = participant.stream?.getVideoTracks?.() || [];
+      if (videoTracks.length) {
+        videoTracks.forEach((_track, index) => annotateLateJoin('video', index));
+      }
+      if (!audioTracks.length && !videoTracks.length) {
+        annotateLateJoin('audio', 0);
+      }
+    });
+
     this.recorder.addEventListener('error', (event) => {
       console.error('Recorder error', event.detail);
       this.setStatusMessage('Recorder error: ' + (event.detail?.message || 'unknown'));
@@ -2674,9 +3511,14 @@ class PodcastStudioApp {
 
     this.recorder.addEventListener('stop', (event) => {
       this.recording = false;
-      this.recordButton.classList.remove('recording');
-      this.recordButton.textContent = 'Arm & Record';
+      this.recordTransitioning = false;
+      this.stopRecordingStatusTimer();
+      this.updateRecordingButtons();
       this.markerButton.disabled = true;
+      if (this.autoMarkerTimeout) {
+        clearTimeout(this.autoMarkerTimeout);
+        this.autoMarkerTimeout = null;
+      }
       this.showOutputsMessage('Finalising recordings…');
       this.trackLevelNodes.clear();
       this.teardownSpectrograms();
@@ -2692,7 +3534,10 @@ class PodcastStudioApp {
       }
       if (this.recordingPlan) {
         this.recordingPlan.files = this.summariseRecordingFiles(event.detail?.files);
-        this.logRecordingEvent('record:stop', { fileCount: this.recordingPlan?.files?.length || 0 });
+        this.logRecordingEvent('record:stop', {
+          fileCount: this.recordingPlan?.files?.length || 0,
+          mode: this.currentRecordingMode,
+        });
         this.updateRecordingPlanStatus('stopped', {
           files: this.recordingPlan.files,
           events: this.recordingPlan.events,
@@ -2743,10 +3588,17 @@ class PodcastStudioApp {
 
     const metrics = createElement('div', 'timeline-track__metrics');
     const inboundMetric = createElement('span', 'timeline-track__metric timeline-track__metric--inbound', {
-      text: participant.external || participant.uuid === 'host-mic' ? 'Inbound: Local capture' : 'Inbound: pending…',
+      text:
+        trackType === 'video'
+          ? participant.external || participant.uuid === 'host-mic'
+            ? 'Inbound: Local capture'
+            : 'Inbound: Video track live'
+          : participant.external || participant.uuid === 'host-mic'
+            ? 'Inbound: Local capture'
+            : 'Inbound: pending…',
     });
     const recordMetric = createElement('span', 'timeline-track__metric timeline-track__metric--recording', {
-      text: 'Recording: waiting…',
+      text: trackType === 'video' ? 'Recording: waiting for video…' : 'Recording: waiting…',
     });
     metrics.append(inboundMetric, recordMetric);
 
@@ -2919,7 +3771,11 @@ class PodcastStudioApp {
         return;
       }
       if (resolvedMetrics?.local) {
-        node.textContent = 'Inbound: Local capture';
+        node.textContent = indicator.trackType === 'video' ? 'Inbound: Local video capture' : 'Inbound: Local capture';
+        return;
+      }
+      if (indicator.trackType === 'video') {
+        node.textContent = 'Inbound: Video track live';
         return;
       }
       const parts = [];
@@ -2957,6 +3813,13 @@ class PodcastStudioApp {
     const elapsedMs = Math.max(1, now - runtime.startedAt);
     const kbps = runtime.bytes ? (runtime.bytes * 8) / elapsedMs : 0;
     const durationSeconds = (now - runtime.startedAt) / 1000;
+    if (indicator.trackType === 'video' || detail?.trackType === 'video') {
+      const videoRateLabel = kbps > 0 ? `${Math.round(kbps)} kbps` : 'capturing…';
+      const durationLabel = this.formatDuration(durationSeconds);
+      indicator.recordMetric.textContent = `Recording: ${videoRateLabel} • Video • ${durationLabel}`;
+      this.trackRuntimeStats.set(key, runtime);
+      return;
+    }
     const sampleRate = this.recorder?.options?.targetSampleRate || 48000;
     const sampleRateLabel =
       sampleRate >= 1000
@@ -2989,6 +3852,11 @@ class PodcastStudioApp {
         prepared: snapshotHighResClock(),
         start: null,
         stop: null,
+      },
+      capture: {
+        mode: this.currentRecordingMode,
+        includeVideo: this.currentRecordingMode === 'video',
+        includeScreenshares: this.currentRecordingMode === 'video',
       },
       participants: {},
       files: [],
@@ -3108,6 +3976,12 @@ class PodcastStudioApp {
     if (!this.recordingStatusNode) {
       return;
     }
+    this.recordingStatusBase = text;
+    this.recordingStatusState = state;
+    if (state === 'active') {
+      this.refreshRecordingStatusLive();
+      return;
+    }
     this.recordingStatusNode.textContent = text;
     this.recordingStatusNode.dataset.state = state;
   }
@@ -3138,33 +4012,57 @@ class PodcastStudioApp {
   }
 
   async handleRecordToggle() {
+    if (this.recordTransitioning) {
+      return;
+    }
     if (this.recording) {
+      this.recordTransitioning = true;
+      this.updateRecordingButtons();
       this.showOutputsMessage('Wrapping up recording…');
       this.logRecordingEvent('record:stop:requested', { reason: 'host-toggle' });
       this.setRecordingStatus('Stopping recording…', 'stopping');
+      if (this.markerButton) {
+        this.markerButton.disabled = true;
+      }
+      if (this.autoMarkerTimeout) {
+        clearTimeout(this.autoMarkerTimeout);
+        this.autoMarkerTimeout = null;
+      }
+      const markerSnapshot = this.markers.map((marker) => ({ ...marker }));
       try {
-        await this.recorder.stop();
+        await this.recorder.stop({ markers: markerSnapshot });
       } catch (error) {
         console.error('Failed to stop recorder cleanly', error);
         this.setStatusMessage('Recording stop failed: ' + (error?.message || 'unknown error'));
+        this.recordTransitioning = false;
+        this.updateRecordingButtons();
       }
       return;
     }
     try {
+      this.recordTransitioning = true;
+      this.updateRecordingButtons();
       let diskInfo = null;
       if (STUDIO_DISK_FEATURE_FLAG && this.diskRecordingEnabled) {
         diskInfo = await this.ensureDiskCaptureReadiness({ interactive: true });
         if (diskInfo && diskInfo.error) {
           this.setStatusMessage(diskInfo.error.message || 'Disk folder not accessible.');
+          this.recordTransitioning = false;
+          this.updateRecordingButtons();
           return;
         }
       }
       this.buildRecordingPlanContext({ diskInfo });
-      this.logRecordingEvent('record:arm', { source: 'host-toggle' });
+      this.logRecordingEvent('record:arm', { source: 'host-toggle', mode: this.currentRecordingMode });
       this.updateRecordingPlanStatus('armed', { events: this.recordingPlan?.events || [] });
-      this.setRecordingStatus('Arming recorders…', 'arming');
+      this.setRecordingStatus(
+        this.currentRecordingMode === 'video' ? 'Arming audio + video ISOs…' : 'Arming audio ISOs…',
+        'arming',
+      );
+      const recordingOptions = this.getRecordingModeOptions(this.currentRecordingMode);
       await this.recorder.start({
-        includeVideo: false,
+        includeVideo: recordingOptions.includeVideo,
+        includeScreenshares: recordingOptions.includeScreenshares,
         includeLocal: false,
         extraParticipants: this.getAdditionalRecordingParticipants(),
       });
@@ -3172,10 +4070,81 @@ class PodcastStudioApp {
       console.error('Failed to start recorder', error);
       this.setStatusMessage('Unable to start recording: ' + (error?.message || 'unknown error'));
       this.updateHostMicUI();
+      this.recordTransitioning = false;
+      this.updateRecordingButtons();
+      this.stopRecordingStatusTimer();
       this.logRecordingEvent('record:error', { stage: 'start', message: error?.message || 'unknown error' });
       this.setRecordingStatus('Recording idle', 'error');
       this.updateRecordingPlanStatus('error', { error: error?.message || 'start failed', events: this.recordingPlan?.events || [] });
       this.setUploadProgressPending(false);
+    }
+  }
+
+  tryAddParticipantToRecording(participant) {
+    if (!this.recording || !this.recorder) {
+      return;
+    }
+    if (!participant?.stream) {
+      return;
+    }
+    try {
+      const result = this.recorder.addParticipant(participant);
+      if (result?.added) {
+        console.log(`Added late-joining participant to recording: ${participant.label || participant.uuid} (offset: ${result.startOffsetSeconds?.toFixed(1)}s)`);
+        this.logRecordingEvent('participant:added-mid-recording', {
+          uuid: participant.uuid,
+          label: participant.label,
+          startOffsetSeconds: result.startOffsetSeconds,
+          trackCount: result.tracks,
+        });
+        // Drop a sync marker so the new track can be aligned with existing tracks
+        this.addSyncMarkerForNewTrack(participant, result.startOffsetSeconds);
+      }
+    } catch (error) {
+      console.warn('Failed to add participant to recording', error);
+    }
+  }
+
+  addSyncMarkerForNewTrack(participant, startOffsetSeconds) {
+    if (!this.recording || !this.recordStartedAt) {
+      return;
+    }
+    // Wait 1 second after track starts, then drop a sync marker
+    // This gives the track time to stabilize before the sync point
+    setTimeout(() => {
+      if (!this.recording) {
+        return;
+      }
+      const timestamp = this.recordStartedAt ? (Date.now() - this.recordStartedAt) / 1000 : startOffsetSeconds + 1;
+      const label = participant?.label || participant?.uuid || 'Guest';
+      const note = {
+        time: timestamp,
+        label: `Sync: ${label} joined @ ${timestamp.toFixed(1)}s`,
+        auto: true,
+        joinSync: true,
+      };
+      this.markers.push(note);
+      this.logRecordingEvent('marker', { label: note.label, timeSeconds: note.time, auto: true, joinSync: true });
+      this.renderMarkers();
+    }, 1000);
+  }
+
+  openRecordShowWindow() {
+    const room = this.resolveRoomName();
+    if (!room) {
+      this.setStatusMessage('Set a room name before recording the show.');
+      return;
+    }
+    // Build URL to the main VDO.ninja with scene + recordwindow
+    const baseUrl = window.location.origin + window.location.pathname.replace(/\/podcast\/?.*/, '');
+    const url = `${baseUrl}/?scene=0&room=${encodeURIComponent(room)}&recordwindow&chroma=000&locked=1.777`;
+    const win = window.open(
+      url,
+      'recordShow',
+      'toolbar=no,location=no,status=no,menubar=no,scrollbars=no,resizable=yes,width=1280,height=720'
+    );
+    if (win) {
+      win.focus();
     }
   }
 
@@ -3204,7 +4173,11 @@ class PodcastStudioApp {
       const downloadUrl = URL.createObjectURL(meta.blob);
       this.activeDownloadUrls.push(downloadUrl);
       const linkLabel = meta.mimeType === 'audio/wav' ? 'Download WAV' : 'Download';
-      const link = createElement('a', 'marker-badge', { text: linkLabel, href: downloadUrl });
+      const linkTitle =
+        meta.mimeType === 'audio/wav'
+          ? 'Download as WAV (includes embedded cue markers).'
+          : 'Download captured media.';
+      const link = createElement('a', 'marker-badge', { text: linkLabel, href: downloadUrl, title: linkTitle });
       const fallbackExtension = meta.mimeType?.split('/')?.[1] || 'webm';
       link.download = meta.filename || `${meta.participant.streamID || meta.participant.uuid}-${meta.trackType}.${fallbackExtension}`;
       const header = createElement('div', 'timeline-entry-header');
@@ -3217,16 +4190,22 @@ class PodcastStudioApp {
       }
       wrapper.append(metaLine);
       const statusContainer = createElement('div', 'upload-status');
-      const driveLine = this.createServiceStatusLine('drive');
+      const localLine = STUDIO_DISK_FEATURE_FLAG ? this.createServiceStatusLine('local') : null;
       const dropboxLine = this.createServiceStatusLine('dropbox');
-      statusContainer.append(driveLine, dropboxLine);
+      if (localLine) {
+        statusContainer.append(localLine);
+      }
+      statusContainer.append(dropboxLine);
       wrapper.append(statusContainer);
       this.outputsContainer.append(wrapper);
+      const transferTasks = [
+        this.queueDropboxUpload(meta, dropboxLine),
+      ];
+      if (localLine) {
+        transferTasks.unshift(this.queueLocalDiskWrite(meta, localLine));
+      }
       uploadPromises.push(
-        this.queueCloudUpload(meta, {
-          drive: driveLine,
-          dropbox: dropboxLine,
-        }),
+        Promise.allSettled(transferTasks),
       );
     });
     if (uploadPromises.length) {
@@ -3240,6 +4219,9 @@ class PodcastStudioApp {
   }
 
   addMarker() {
+    if (!this.recording) {
+      return;
+    }
     const timestamp = this.recordStartedAt ? (Date.now() - this.recordStartedAt) / 1000 : 0;
     const note = {
       time: timestamp,
@@ -3250,20 +4232,183 @@ class PodcastStudioApp {
     this.renderMarkers();
   }
 
+  scheduleAutoSyncMarker() {
+    if (this.autoMarkerTimeout) {
+      return;
+    }
+    this.autoMarkerTimeout = setTimeout(() => {
+      this.autoMarkerTimeout = null;
+      if (!this.recording) {
+        return;
+      }
+      const timestamp = this.recordStartedAt ? (Date.now() - this.recordStartedAt) / 1000 : 1;
+      const note = {
+        time: timestamp,
+        label: `Auto sync @ ${timestamp.toFixed(1)}s`,
+        auto: true,
+      };
+      this.markers.push(note);
+      this.logRecordingEvent('marker', { label: note.label, timeSeconds: note.time, auto: true });
+      this.renderMarkers();
+    }, 1000);
+  }
+
+  escapeCsvValue(value) {
+    const raw = value === null || typeof value === 'undefined' ? '' : String(value);
+    const escaped = raw.replace(/\"/g, '""');
+    return `"${escaped}"`;
+  }
+
+  formatMarkerTimecode(seconds) {
+    const safeSeconds = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+    const totalMs = Math.round(safeSeconds * 1000);
+    const hours = Math.floor(totalMs / 3600000);
+    const minutes = Math.floor((totalMs % 3600000) / 60000);
+    const secs = Math.floor((totalMs % 60000) / 1000);
+    const ms = totalMs % 1000;
+    if (hours > 0) {
+      return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
+    }
+    return `${minutes}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
+  }
+
+  buildMarkersCsv() {
+    const markers = Array.isArray(this.markers) ? this.markers : [];
+    const header = ['index', 'time_seconds', 'timecode', 'label', 'auto'].join(',');
+    if (!markers.length) {
+      return `${header}\n`;
+    }
+    const rows = markers.map((marker, index) => {
+      const timeSeconds = Number.isFinite(marker?.time) ? marker.time : 0;
+      const timecode = this.formatMarkerTimecode(timeSeconds);
+      const label = marker?.label || `Marker #${index + 1}`;
+      const auto = marker?.auto ? '1' : '0';
+      return [
+        index + 1,
+        timeSeconds.toFixed(3),
+        this.escapeCsvValue(timecode),
+        this.escapeCsvValue(label),
+        auto,
+      ].join(',');
+    });
+    return `${header}\n${rows.join('\n')}\n`;
+  }
+
+  buildMarkersFilename() {
+    const sessionId = this.recordingSessionId || this.recordingPlan?.sessionId || 'session';
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    return `vdo-ninja-markers-${sessionId}-${timestamp}.csv`;
+  }
+
+  exportMarkersCsv() {
+    if (!this.markerExportButton) {
+      return;
+    }
+    const csv = this.buildMarkersCsv();
+    if (!csv.trim()) {
+      return;
+    }
+    // Visual feedback while preparing download
+    const originalText = this.markerExportButton.textContent;
+    this.markerExportButton.textContent = 'Exporting…';
+    this.markerExportButton.disabled = true;
+
+    // Small delay to show feedback before download triggers
+    setTimeout(() => {
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      try {
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = this.buildMarkersFilename();
+        link.rel = 'noopener';
+        link.click();
+        this.markerExportButton.textContent = 'Exported';
+      } catch (error) {
+        console.warn('Failed to trigger CSV download', error);
+        this.markerExportButton.textContent = 'Export failed';
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+        // Restore button after a moment
+        setTimeout(() => {
+          if (this.markerExportButton) {
+            this.markerExportButton.textContent = originalText;
+            this.markerExportButton.disabled = false;
+          }
+        }, 1500);
+      }
+    }, 50);
+  }
+
+  async copyMarkersCsv() {
+    if (!this.markerCopyButton) {
+      return;
+    }
+    const csv = this.buildMarkersCsv();
+    if (!csv.trim()) {
+      return;
+    }
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(csv);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = csv;
+        textarea.setAttribute('readonly', 'true');
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        document.body.append(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        textarea.remove();
+      }
+      this.markerCopyButton.textContent = 'Copied';
+      if (this.markerCopyResetTimer) {
+        clearTimeout(this.markerCopyResetTimer);
+      }
+      this.markerCopyResetTimer = setTimeout(() => {
+        this.markerCopyResetTimer = null;
+        if (this.markerCopyButton) {
+          this.markerCopyButton.textContent = 'Copy CSV';
+        }
+      }, 1500);
+    } catch (error) {
+      console.warn('Copy markers failed', error);
+      this.markerCopyButton.textContent = 'Copy failed';
+      if (this.markerCopyResetTimer) {
+        clearTimeout(this.markerCopyResetTimer);
+      }
+      this.markerCopyResetTimer = setTimeout(() => {
+        this.markerCopyResetTimer = null;
+        if (this.markerCopyButton) {
+          this.markerCopyButton.textContent = 'Copy CSV';
+        }
+      }, 2000);
+    }
+  }
+
   renderMarkers() {
     this.markerLog.innerHTML = '';
+    if (this.markerActions) {
+      this.markerActions.style.display = this.markers.length ? '' : 'none';
+    }
     if (!this.markers.length) {
-      const empty = createElement('div', 'empty-state', { text: 'Tap “Add Marker” to drop cue points during recording.' });
+      const empty = createElement('div', 'empty-state', { text: 'Tap “Marker” to drop cue points during recording.' });
       empty.dataset.empty = 'true';
       this.markerLog.append(empty);
       return;
     }
-    this.markers.forEach((marker, index) => {
+    // Render newest markers first (reverse order) so they appear at the top
+    for (let i = this.markers.length - 1; i >= 0; i -= 1) {
+      const marker = this.markers[i];
+      const timeSeconds = Number.isFinite(marker?.time) ? marker.time : 0;
+      const timecode = this.formatMarkerTimecode(timeSeconds);
       const item = createElement('div', 'marker-item');
+      item.title = `${marker?.auto ? 'Auto sync' : 'Marker'} @ ${timecode}`;
       item.append(createElement('span', '', { text: marker.label }));
-      item.append(createElement('span', 'marker-badge', { text: `#${index + 1}` }));
+      item.append(createElement('span', 'marker-badge', { text: `#${i + 1}` }));
       this.markerLog.append(item);
-    });
+    }
   }
 
   startRosterLoop() {
@@ -3297,6 +4442,8 @@ class PodcastStudioApp {
         const item = this.createRosterItem(participant);
         this.rosterItems.set(participant.uuid, item);
         this.rosterList.append(item);
+        // Add new participant to active recording
+        this.tryAddParticipantToRecording(participant);
       }
     });
 
@@ -3314,6 +4461,12 @@ class PodcastStudioApp {
       }
     }
   });
+    this.updateGuestBackupControls();
+    this.updateReadinessSummary();
+    this.refreshRecordingStatusLive();
+    if (this.icecastPublisher?.isLive()) {
+      this.icecastPublisher.refreshSources();
+    }
   }
 
   createRosterItem(participant) {
@@ -3323,6 +4476,14 @@ class PodcastStudioApp {
     if (participant.role) {
       item.dataset.role = participant.role;
     }
+
+    // Video thumbnail for guest preview
+    const videoThumb = document.createElement('video');
+    videoThumb.className = 'roster-item__video-thumb';
+    videoThumb.muted = true;
+    videoThumb.playsInline = true;
+    videoThumb.autoplay = true;
+    videoThumb.dataset.noVideo = 'true'; // hidden by default until video track available
 
     const meta = createElement('div', 'roster-meta');
     meta.append(createElement('div', 'roster-name', { text: participant.label }));
@@ -3334,9 +4495,12 @@ class PodcastStudioApp {
     }
 
     const meter = createElement('div', 'meter-bar', { 'data-meter': participant.uuid });
-   meter.append(createElement('div', 'meter-bar-fill'));
+    meter.append(createElement('div', 'meter-bar-fill'));
 
-    item.append(meta, meter);
+    const mediaRow = createElement('div', 'roster-item__media-row');
+    mediaRow.append(videoThumb, meter);
+
+    item.append(meta, mediaRow);
 
     const actions = createElement('div', 'roster-actions');
     const actionRow = createElement('div', 'roster-action-row');
@@ -3345,6 +4509,7 @@ class PodcastStudioApp {
       const controlButton = createElement('button', 'roster-action-button', {
         type: 'button',
         text: 'Remote Controls',
+        title: 'Open legacy remote controls for this guest.',
       });
       controlButton.addEventListener('click', () => this.openRemoteControls(participant.uuid));
       actionRow.append(controlButton);
@@ -3356,10 +4521,10 @@ class PodcastStudioApp {
       hasActions = true;
     }
     if (hasActions) {
-      actions.append(actionRow);
       if (driveControls?.status) {
-        actions.append(driveControls.status);
+        actionRow.append(driveControls.status);
       }
+      actions.append(actionRow);
       item.append(actions);
     }
 
@@ -3386,6 +4551,24 @@ class PodcastStudioApp {
     }
     this.applyMeterValue(participant.uuid, participant.audioLevel || 0);
     this.updateDriveActionAvailability(participant.uuid);
+
+    // Update video thumbnail if available
+    const videoThumb = item.querySelector('.roster-item__video-thumb');
+    if (videoThumb && this.session?.rpcs) {
+      const peer = this.session.rpcs[participant.uuid];
+      const videoTracks = peer?.streamSrc?.getVideoTracks?.() || [];
+      if (videoTracks.length > 0) {
+        if (!videoThumb.srcObject || videoThumb.srcObject.getVideoTracks()[0]?.id !== videoTracks[0].id) {
+          videoThumb.srcObject = new MediaStream(videoTracks);
+        }
+        videoThumb.dataset.noVideo = 'false';
+      } else {
+        if (videoThumb.srcObject) {
+          videoThumb.srcObject = null;
+        }
+        videoThumb.dataset.noVideo = 'true';
+      }
+    }
   }
 
   createDriveControl(participant) {
@@ -3397,7 +4580,8 @@ class PodcastStudioApp {
     }
     const button = createElement('button', 'roster-action-button roster-action-button--drive', {
       type: 'button',
-      text: 'Drive Upload',
+      text: 'Guest → Drive',
+      title: 'Record guest to Google Drive (video + audio)',
     });
     button.dataset.uuid = participant.uuid;
     button.addEventListener('click', () => this.handleDriveRecordToggle(participant.uuid));
@@ -3418,13 +4602,116 @@ class PodcastStudioApp {
     if (!uuid) {
       return;
     }
+    this.clearDriveRequestTimers(uuid);
     if (this.driveStatusResetTimers.has(uuid)) {
       clearTimeout(this.driveStatusResetTimers.get(uuid));
       this.driveStatusResetTimers.delete(uuid);
     }
     this.rosterDriveButtons.delete(uuid);
     this.rosterDriveStatuses.delete(uuid);
+    this.driveRecorderStates.delete(uuid);
     this.driveProgressSnapshots.delete(uuid);
+  }
+
+  clearDriveRequestTimers(uuid) {
+    if (!uuid) {
+      return;
+    }
+    const timers = this.driveRequestTimers.get(uuid);
+    if (!timers) {
+      return;
+    }
+    if (timers.ack) {
+      clearTimeout(timers.ack);
+    }
+    if (timers.stale) {
+      clearTimeout(timers.stale);
+    }
+    this.driveRequestTimers.delete(uuid);
+  }
+
+  isDriveRecorderHeartbeatActive(uuid) {
+    const state = this.driveRecorderStates.get(uuid);
+    if (!state) {
+      return false;
+    }
+    if (!(state.code >= 0 || state.code === -5 || state.code === -2)) {
+      return false;
+    }
+    if (!state.at) {
+      return true;
+    }
+    return Date.now() - state.at <= DRIVE_RECORDER_HEARTBEAT_GRACE_MS;
+  }
+
+  scheduleDriveRequestWatchdog(uuid) {
+    if (!uuid) {
+      return;
+    }
+    this.clearDriveRequestTimers(uuid);
+    const timers = {
+      ack: null,
+      stale: null,
+    };
+    timers.ack = setTimeout(() => {
+      const latestSnapshot = this.driveProgressSnapshots.get(uuid);
+      if (latestSnapshot) {
+        this.setRosterDriveStatusFromSnapshot(uuid, latestSnapshot);
+        return;
+      }
+      const legacyButton = this.findLegacyDriveButton(uuid);
+      const pressed = Boolean(legacyButton?.classList?.contains('pressed'));
+      this.setRosterDriveStatus(
+        uuid,
+        'pending',
+        pressed
+          ? 'Drive requested. Waiting for guest recorder to start…'
+          : 'Drive request sent. Waiting for guest to confirm recording permission…',
+      );
+      const runStaleCheck = () => {
+        const staleSnapshot = this.driveProgressSnapshots.get(uuid);
+        if (staleSnapshot) {
+          this.setRosterDriveStatusFromSnapshot(uuid, staleSnapshot);
+          return;
+        }
+        const stillPressed = Boolean(this.findLegacyDriveButton(uuid)?.classList?.contains('pressed'));
+        if (this.isDriveRecorderHeartbeatActive(uuid)) {
+          this.setRosterDriveStatus(uuid, 'pending', 'Guest recorder is active. Waiting for Drive upload stats…');
+          timers.stale = setTimeout(runStaleCheck, DRIVE_REQUEST_STALE_TIMEOUT_MS);
+          this.driveRequestTimers.set(uuid, timers);
+          return;
+        }
+        if (!stillPressed) {
+          this.setRosterDriveStatus(uuid, 'error', 'Guest did not confirm Drive recording.');
+          this.updateDriveActionAvailability(uuid);
+        } else {
+          this.setRosterDriveStatus(uuid, 'error', 'Drive upload never started. Ask guest to allow recording and retry.');
+          this.updateDriveActionAvailability(uuid);
+        }
+        this.clearDriveRequestTimers(uuid);
+      };
+      timers.stale = setTimeout(runStaleCheck, DRIVE_REQUEST_STALE_TIMEOUT_MS);
+      this.driveRequestTimers.set(uuid, timers);
+    }, DRIVE_REQUEST_ACK_TIMEOUT_MS);
+    this.driveRequestTimers.set(uuid, timers);
+  }
+
+  reconcileDriveRequestOutcome(uuid) {
+    if (!uuid) {
+      return;
+    }
+    const latestSnapshot = this.driveProgressSnapshots.get(uuid);
+    if (latestSnapshot) {
+      this.setRosterDriveStatusFromSnapshot(uuid, latestSnapshot);
+      return;
+    }
+    const legacyButton = this.findLegacyDriveButton(uuid);
+    const pressed = Boolean(legacyButton?.classList?.contains('pressed'));
+    if (pressed) {
+      this.setRosterDriveStatus(uuid, 'pending', 'Drive request sent. Waiting for upload telemetry…');
+      return;
+    }
+    this.setRosterDriveStatus(uuid, 'error', 'Drive upload not started. Retry and have the guest accept the recording prompt.');
   }
 
   findLegacyDriveButton(uuid) {
@@ -3441,7 +4728,52 @@ class PodcastStudioApp {
     return Boolean(this.cloud?.hasDriveAccess());
   }
 
-  async handleDriveRecordToggle(uuid) {
+  async handleGuestBackupToggle() {
+    const snapshot = this.getGuestBackupSnapshot();
+    if (!snapshot.total) {
+      this.updateGuestBackupControls();
+      this.updateReadinessSummary();
+      return;
+    }
+    if (!this.canTriggerDriveUpload()) {
+      if (this.guestBackupStatusNode) {
+        this.guestBackupStatusNode.textContent = 'Link Google Drive first';
+        this.guestBackupStatusNode.dataset.state = 'error';
+      }
+      this.updateReadinessSummary();
+      return;
+    }
+    const stopTargets = snapshot.participants.filter((entry) => entry.requested).map((entry) => entry.uuid);
+    const armTargets = snapshot.participants.filter((entry) => !entry.requested).map((entry) => entry.uuid);
+    const stopping = snapshot.requested === snapshot.total;
+    const targets = stopping ? stopTargets : armTargets;
+    if (!targets.length) {
+      this.updateGuestBackupControls();
+      this.updateReadinessSummary();
+      return;
+    }
+    this.guestBackupBusy = true;
+    this.updateGuestBackupControls();
+    try {
+      if (stopping) {
+        for (const uuid of targets) {
+          // Reuse the existing per-guest stop path so the legacy UI stays in sync.
+          await this.handleDriveRecordToggle(uuid);
+        }
+      } else {
+        for (const uuid of targets) {
+          await this.handleDriveRecordToggle(uuid, { bitrate: DEFAULT_GUEST_BACKUP_BITRATE });
+        }
+      }
+    } finally {
+      this.guestBackupBusy = false;
+      this.updateGuestBackupControls();
+      this.updateReadinessSummary();
+      this.refreshRecordingStatusLive();
+    }
+  }
+
+  async handleDriveRecordToggle(uuid, { bitrate = null } = {}) {
     if (!uuid) {
       return;
     }
@@ -3469,18 +4801,36 @@ class PodcastStudioApp {
     button.disabled = true;
     try {
       if (isActive) {
+        this.clearDriveRequestTimers(uuid);
+        this.driveRecorderStates.delete(uuid);
         await window.requestGoogleDriveRecord(legacyButton, false);
         this.setRosterDriveStatus(uuid, 'idle', DRIVE_STATUS_MESSAGES.idle);
       } else {
+        // Drop any stale snapshot from a prior upload so a new request must
+        // wait for fresh telemetry before reconciling success/failure.
+        this.driveProgressSnapshots.delete(uuid);
+        this.driveRecorderStates.delete(uuid);
         this.setRosterDriveStatus(uuid, 'pending', 'Requesting Drive upload…');
-        await window.requestGoogleDriveRecord(legacyButton);
+        await window.requestGoogleDriveRecord(legacyButton, true, bitrate);
+        const started = Boolean(legacyButton.classList?.contains('pressed'))
+          || Boolean(this.driveProgressSnapshots.get(uuid))
+          || this.isDriveRecorderHeartbeatActive(uuid);
+        if (started) {
+          this.scheduleDriveRequestWatchdog(uuid);
+          this.reconcileDriveRequestOutcome(uuid);
+        } else {
+          this.setRosterDriveStatus(uuid, 'idle', DRIVE_STATUS_MESSAGES.idle);
+        }
       }
     } catch (error) {
+      this.clearDriveRequestTimers(uuid);
       const message = error?.message || 'Drive request cancelled';
       this.setRosterDriveStatus(uuid, 'error', message);
     } finally {
       button.dataset.pending = 'false';
       this.updateDriveActionAvailability(uuid);
+      this.updateReadinessSummary();
+      this.refreshRecordingStatusLive();
     }
   }
 
@@ -3515,7 +4865,7 @@ class PodcastStudioApp {
     }
 
     button.disabled = disabled;
-    button.textContent = isActive ? 'Stop Drive Upload' : 'Drive Upload';
+    button.textContent = isActive ? 'Stop Guest → Drive' : 'Guest → Drive';
     button.dataset.state = isActive ? 'active' : 'idle';
     if (title) {
       button.title = title;
@@ -3538,6 +4888,9 @@ class PodcastStudioApp {
     const label = text || DRIVE_STATUS_MESSAGES[state] || DRIVE_STATUS_MESSAGES.idle;
     node.dataset.state = state;
     node.textContent = label;
+    if (state === 'done' || state === 'idle' || state === 'error') {
+      this.clearDriveRequestTimers(uuid);
+    }
     if (state === 'done') {
       const timer = setTimeout(() => {
         this.setRosterDriveStatus(uuid, 'idle', DRIVE_STATUS_MESSAGES.idle);
@@ -3545,6 +4898,9 @@ class PodcastStudioApp {
       }, DRIVE_STATUS_RESET_MS);
       this.driveStatusResetTimers.set(uuid, timer);
     }
+    this.updateGuestBackupControls();
+    this.updateReadinessSummary();
+    this.refreshRecordingStatusLive();
   }
 
   applyDriveSnapshot(uuid) {
@@ -3560,6 +4916,7 @@ class PodcastStudioApp {
       this.setRosterDriveStatus(uuid, 'idle', DRIVE_STATUS_MESSAGES.idle);
       return;
     }
+    this.clearDriveRequestTimers(uuid);
     if (gdrive.state === 2) {
       this.setRosterDriveStatus(uuid, 'done', DRIVE_STATUS_MESSAGES.done);
       return;
@@ -3584,6 +4941,63 @@ class PodcastStudioApp {
     }
     this.setRosterDriveStatusFromSnapshot(uuid, gdrive || null);
     this.updateDriveActionAvailability(uuid);
+    this.updateReadinessSummary();
+    this.refreshRecordingStatusLive();
+  }
+
+  handleRemoteRecorderStatusEvent(event) {
+    const detail = event?.detail;
+    if (!detail || !detail.UUID) {
+      return;
+    }
+    const { UUID: uuid, recorder, screen } = detail;
+    if (screen || !this.rosterDriveStatuses.has(uuid)) {
+      return;
+    }
+    const legacyDriveButton = this.findLegacyDriveButton(uuid);
+    const hasWatchdog = this.driveRequestTimers.has(uuid);
+    const drivePressed = Boolean(legacyDriveButton?.classList?.contains('pressed'));
+    const currentState = this.rosterDriveStatuses.get(uuid)?.dataset?.state || 'idle';
+    const driveStateActive = currentState === 'pending' || currentState === 'uploading';
+    if (!hasWatchdog && !drivePressed && !driveStateActive) {
+      // Ignore generic remote-recorder updates unless Drive was actually requested/active.
+      return;
+    }
+    const code = parseInt(recorder, 10);
+    if (!Number.isFinite(code)) {
+      return;
+    }
+    this.driveRecorderStates.set(uuid, { code, at: Date.now() });
+    if (code >= 0) {
+      if (!this.driveProgressSnapshots.get(uuid)) {
+        const minutes = Math.floor(code / 60);
+        const seconds = Math.max(0, code - minutes * 60).toString().padStart(2, '0');
+        this.setRosterDriveStatus(uuid, 'pending', `Guest recording ${minutes}m ${seconds}s… waiting for Drive stats`);
+      }
+      this.updateDriveActionAvailability(uuid);
+      return;
+    }
+    if (code === -5) {
+      this.setRosterDriveStatus(uuid, 'pending', 'Guest recorder started with experimental browser support.');
+    } else if (code === -4) {
+      this.setRosterDriveStatus(uuid, 'error', 'Guest recording stopped unexpectedly.');
+    } else if (code === -3) {
+      this.setRosterDriveStatus(uuid, 'error', 'Guest browser cannot record/upload to Drive.');
+    } else if (code === -2) {
+      this.setRosterDriveStatus(uuid, 'pending', 'Guest recorder stopping…');
+    } else if (code === -1) {
+      const snapshot = this.driveProgressSnapshots.get(uuid);
+      if (snapshot) {
+        this.setRosterDriveStatusFromSnapshot(uuid, snapshot);
+      } else if (hasWatchdog || drivePressed || driveStateActive) {
+        this.setRosterDriveStatus(uuid, 'error', 'Guest recorder stopped before Drive upload telemetry started.');
+      } else {
+        this.setRosterDriveStatus(uuid, 'idle', DRIVE_STATUS_MESSAGES.idle);
+      }
+    }
+    this.updateDriveActionAvailability(uuid);
+    this.updateReadinessSummary();
+    this.refreshRecordingStatusLive();
   }
 
   ensureRemoteOverlay() {
@@ -3597,7 +5011,7 @@ class PodcastStudioApp {
     const panel = createElement('div', 'remote-overlay__panel');
     const header = createElement('div', 'remote-overlay__header');
     const title = createElement('h3', 'remote-overlay__title', { text: 'Remote controls' });
-    const closeButton = createElement('button', 'remote-overlay__close', { type: 'button', text: 'Close' });
+    const closeButton = createElement('button', 'remote-overlay__close', { type: 'button', text: 'Close', title: 'Close remote controls.' });
     closeButton.addEventListener('click', () => this.closeRemoteOverlay());
     header.append(title, closeButton);
 
@@ -3730,6 +5144,172 @@ class PodcastStudioApp {
     }
   }
 
+  openHelpModal() {
+    if (this.helpOverlay) {
+      this.helpOverlay.dataset.visible = 'true';
+      return;
+    }
+
+    const overlay = createElement('div', 'help-overlay');
+    overlay.dataset.visible = 'true';
+    overlay.dataset.podcastOverlay = 'true'; // Prevent CSS from hiding it
+    this.helpOverlay = overlay;
+
+    const panel = createElement('div', 'help-overlay__panel');
+
+    const header = createElement('div', 'help-overlay__header');
+    const title = createElement('h2', 'help-overlay__title', { text: 'Podcast Studio Guide' });
+    const closeButton = createElement('button', 'help-overlay__close', { type: 'button', text: '✕', title: 'Close' });
+    closeButton.addEventListener('click', () => this.closeHelpModal());
+    header.append(title, closeButton);
+
+    const content = createElement('div', 'help-overlay__content');
+
+    const sections = [
+      {
+        title: 'Getting Started',
+        content: `
+          <p>The Podcast Studio is a specialized interface for recording multi-track audio from remote guests.</p>
+          <ul>
+            <li><strong>Create a room</strong> — Enter a room name and optional password</li>
+            <li><strong>Share the invite link</strong> — Guests join via the generated link</li>
+            <li><strong>Review Capture / Backup / Save</strong> — The summary card tells you what is being captured, whether live guest backup is active, and where files save after stop</li>
+            <li><strong>Start Recording</strong> — Each guest's audio is captured as a separate WAV file, or audio + video if you enable the experimental capture mode</li>
+          </ul>
+          <p>All audio is recorded locally in your browser — nothing is uploaded unless you link cloud storage.</p>
+        `,
+      },
+      {
+        title: 'Session Markers',
+        content: `
+          <p>Markers are cue points you can drop during recording to mark important moments.</p>
+          <ul>
+            <li><strong>Manual markers</strong> — Click "Marker" to drop a cue at the current time</li>
+            <li><strong>Auto sync markers</strong> — Dropped automatically ~1 second into recording for alignment</li>
+            <li><strong>Join sync markers</strong> — Created when a guest joins mid-recording</li>
+          </ul>
+          <p><strong>WAV cue points:</strong> Markers are embedded directly in the WAV files as standard cue chunks. Compatible with:</p>
+          <ul>
+            <li>Adobe Audition, Audacity, Reaper, Pro Tools</li>
+            <li>Most DAWs that support WAV cue/region markers</li>
+          </ul>
+          <p><strong>CSV export:</strong> Use "Export CSV" or "Copy CSV" to get markers in spreadsheet format for reference or importing into editors that don't read WAV cues.</p>
+        `,
+      },
+      {
+        title: 'Late Joiners & Reconnects',
+        content: `
+          <p>If a guest joins or reconnects while recording is in progress:</p>
+          <ul>
+            <li>Their audio is automatically added to the recording</li>
+            <li>A sync marker is dropped ~1 second after they join</li>
+            <li>Their track appears in the timeline with a "Late join" badge</li>
+          </ul>
+          <p><strong>Syncing in post:</strong> Each track's markers are adjusted relative to when that track started. Use the shared sync markers to align tracks in your editor.</p>
+          <p>Experimental video ISO capture keeps the same late-join offsets, but longer runs will use much more memory than audio-only sessions.</p>
+        `,
+      },
+      {
+        title: 'Cloud Backup',
+        content: `
+          <p>Link Google Drive or Dropbox to save host-side recordings after the session ends.</p>
+          <p><strong>Google Drive:</strong></p>
+          <ul>
+            <li>Uploads complete files after recording stops</li>
+            <li>Files appear in a "VDO.Ninja Recordings" folder</li>
+          </ul>
+          <p><strong>Dropbox:</strong></p>
+          <ul>
+            <li>Supports chunked uploads for large files</li>
+            <li>More reliable for longer recordings</li>
+            <li>Can paste a token manually if popup is blocked</li>
+          </ul>
+          <p><strong>Guest backup:</strong> The "Enable guest backup" control asks every connected guest to self-record directly into your Google Drive. A guest only counts as backed up after they confirm the browser prompt.</p>
+          <p>Both services are optional — recordings are always available for local download.</p>
+        `,
+      },
+      {
+        title: 'Video Recording',
+        content: `
+          <p>The studio focuses on audio ISO recording, but video options exist:</p>
+          <ul>
+            <li><strong>Audio + Video ISO</strong> - Add <code>?studiovideo=1</code> to the studio URL to expose the experimental capture mode in the destinations card</li>
+            <li><strong>Record Group</strong> - Opens a popup with the combined scene for screen recording</li>
+            <li><strong>Individual video workflow</strong> - <a href="https://www.youtube.com/watch?v=s5shpEqLZbM" target="_blank" rel="noopener">See video guide ↗</a></li>
+          </ul>
+          <p>The studio video ISO mode is still memory-heavy because files finalize after stop. For the most resilient long-form runs, guests can still use <code>&record</code> in their URL or the remote recording features in the classic VDO.Ninja interface.</p>
+        `,
+      },
+      {
+        title: 'Recording Model',
+        content: `
+          <p>The studio now separates recording into three questions:</p>
+          <ul>
+            <li><strong>Capture</strong> - Audio ISO by default, or experimental Audio + Video ISO with <code>?studiovideo=1</code></li>
+            <li><strong>Backup</strong> - "Enable guest backup" requests guest-side self-recording directly into your Google Drive</li>
+            <li><strong>Save</strong> - Host-side downloads and cloud uploads still finalize after recording stops</li>
+          </ul>
+          <p><strong>Important:</strong> A linked destination is not the same as a live backup. The summary warning stays yellow until guest backups are actually confirmed.</p>
+        `,
+      },
+      {
+        title: 'Live Captions',
+        content: `
+          <p>VDO.Ninja supports real-time speech-to-text captions:</p>
+          <ul>
+            <li><strong>Enable captions</strong> — Add <code>&transcribe</code> to a guest's URL to enable browser-based speech recognition</li>
+            <li><strong>Display captions</strong> — Use <code>&showcc</code> on the viewer/scene URL to display incoming captions</li>
+            <li><strong>Overlay in OBS</strong> — Captions can be displayed as a text overlay in your stream</li>
+          </ul>
+          <p>Captions are processed locally in the browser using the Web Speech API — no third-party services required.</p>
+        `,
+      },
+      {
+        title: 'Tips & Troubleshooting',
+        content: `
+          <ul>
+            <li><strong>No audio?</strong> — Ensure guests have granted microphone permission</li>
+            <li><strong>Tracks missing?</strong> — Check that guests joined before hitting Record, or they'll appear as late joiners</li>
+            <li><strong>Large files?</strong> — Use Dropbox for chunked uploads, or download locally</li>
+            <li><strong>Browser support:</strong> — Chrome/Edge recommended. Firefox/Safari may have limitations</li>
+          </ul>
+        `,
+      },
+    ];
+
+    sections.forEach((section) => {
+      const item = createElement('details', 'help-section');
+      const summary = createElement('summary', 'help-section__title', { text: section.title });
+      const body = createElement('div', 'help-section__body');
+      body.innerHTML = section.content;
+      item.append(summary, body);
+      content.append(item);
+    });
+
+    // Open first section by default
+    const firstSection = content.querySelector('details');
+    if (firstSection) {
+      firstSection.open = true;
+    }
+
+    panel.append(header, content);
+    overlay.append(panel);
+
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) {
+        this.closeHelpModal();
+      }
+    });
+
+    document.body.appendChild(overlay);
+  }
+
+  closeHelpModal() {
+    if (this.helpOverlay) {
+      this.helpOverlay.dataset.visible = 'false';
+    }
+  }
+
   describeParticipantRole(participant) {
     if (!participant) {
       return '';
@@ -3772,60 +5352,113 @@ class PodcastStudioApp {
         : 'Dropbox link pending';
       this.dropboxStatusNode.textContent = dropboxText;
     }
+    this.refreshUploadProgress('dropbox');
     this.updateCloudLinkUI();
     this.updateReadinessSummary();
   }
 
   updateReadinessSummary() {
-    if (this.cloudSummaryNode) {
-      const state = readCloudLinkStatus();
-      const driveActive = Boolean(this.cloud?.hasDriveAccess());
-      const driveCached = isCloudLinkFresh(state.drive);
-      const dropboxActive = Boolean(this.cloud?.hasDropboxAccess());
-      const dropboxCached = isCloudLinkFresh(state.dropbox);
-      const driveStatus = driveActive
-        ? `Drive ready${state.drive?.linkedAt ? ` (${formatRelativeTime(state.drive.linkedAt) || 'just now'})` : ''}`
-        : driveCached
-          ? `Drive linked earlier (${formatRelativeTime(state.drive.linkedAt) || 'recently'}). Re-link to enable backups.`
-          : 'Drive not linked';
-      const dropboxStatus = dropboxActive
-        ? `Dropbox ready${state.dropbox?.linkedAt ? ` (${formatRelativeTime(state.dropbox.linkedAt) || 'just now'})` : ''}`
-        : dropboxCached
-          ? `Dropbox linked earlier (${formatRelativeTime(state.dropbox.linkedAt) || 'recently'}). Re-link to enable backups.`
-          : 'Dropbox not linked';
-      this.cloudSummaryNode.textContent = `Cloud uploads: ${driveStatus} • ${dropboxStatus}`;
-      this.cloudSummaryNode.dataset.state = driveActive || dropboxActive ? 'ready' : dropboxCached || driveCached ? 'error' : 'pending';
+    const driveActive = Boolean(this.cloud?.hasDriveAccess());
+    const dropboxActive = Boolean(this.cloud?.hasDropboxAccess());
+    const diskMeta = readDiskRecordingState();
+    const diskReady = Boolean(STUDIO_DISK_FEATURE_FLAG && diskMeta.enabled && diskMeta.folderName);
+    const guestBackup = this.getGuestBackupSnapshot();
+    const icecastLive = Boolean(this.icecastPublisher?.isLive());
+    if (this.isoSummary) {
+      this.isoSummary.style.display = (driveActive || dropboxActive || diskReady || icecastLive) ? '' : 'none';
     }
-    if (this.diskSummaryNode) {
-      if (!STUDIO_DISK_FEATURE_FLAG) {
-        this.diskSummaryNode.textContent = 'Disk capture disabled via ?studioiso=0';
-        this.diskSummaryNode.dataset.state = 'disabled';
-        return;
+    this.updateDestinationLights(driveActive, dropboxActive, diskReady, diskMeta, guestBackup);
+
+    if (this.captureSummaryNode) {
+      this.captureSummaryNode.textContent = `Capture: ${this.describeCaptureMode(this.currentRecordingMode)}`;
+    }
+    if (this.backupSummaryNode) {
+      if (!guestBackup.total) {
+        this.backupSummaryNode.textContent = 'Backup: No guests connected';
+      } else if (!guestBackup.requested) {
+        this.backupSummaryNode.textContent = 'Backup: None';
+      } else {
+        this.backupSummaryNode.textContent = `Backup: Guest backup ${guestBackup.confirmed}/${guestBackup.total} confirmed`;
       }
-      if (typeof window.showDirectoryPicker !== 'function') {
-        this.diskSummaryNode.textContent = 'Disk capture: browser not supported';
-        this.diskSummaryNode.dataset.state = 'disabled';
-        return;
+    }
+    if (this.saveSummaryNode) {
+      this.saveSummaryNode.textContent = `Save: ${this.describeSaveTargetSummary()}`;
+    }
+    if (this.summaryWarningNode) {
+      let warningText = 'No live backup active. Host capture stays buffered until stop.';
+      let warningState = '';
+      if (!guestBackup.total) {
+        warningText = 'No guests connected yet. Host capture stays buffered until stop.';
+        warningState = 'pending';
+      } else if (guestBackup.confirmed === guestBackup.total && guestBackup.total > 0) {
+        warningText = 'Live guest backup active for all connected guests.';
+        warningState = 'ready';
+      } else if (guestBackup.requested) {
+        warningText = `Live guest backup confirmed for ${guestBackup.confirmed}/${guestBackup.total}. Unconfirmed guests are not backed up yet.`;
       }
-      const diskState = readDiskRecordingState();
-      if (diskState.lastError) {
-        this.diskSummaryNode.textContent = `Disk capture: ${diskState.lastError}`;
-        this.diskSummaryNode.dataset.state = 'error';
-        return;
+      this.summaryWarningNode.textContent = warningText;
+      if (warningState) {
+        this.summaryWarningNode.dataset.state = warningState;
+      } else if (this.summaryWarningNode.dataset) {
+        delete this.summaryWarningNode.dataset.state;
       }
-      if (!diskState.folderName) {
-        this.diskSummaryNode.textContent = 'Disk capture: folder not selected';
-        this.diskSummaryNode.dataset.state = 'pending';
-        return;
+    }
+    if (this.cloudSummaryNode) {
+      const afterSessionTargets = [];
+      if (diskReady) {
+        afterSessionTargets.push(`Local folder (${diskMeta.folderName})`);
       }
-      if (!diskState.enabled) {
-        this.diskSummaryNode.textContent = `Disk capture: ${diskState.folderName} (toggle off)`;
-        this.diskSummaryNode.dataset.state = 'idle';
-        return;
+      if (driveActive) {
+        afterSessionTargets.push('Drive');
       }
-      const verified = diskState.lastVerifiedAt ? `checked ${formatRelativeTime(diskState.lastVerifiedAt)}` : 'awaiting verification';
-      this.diskSummaryNode.textContent = `Disk capture: ${diskState.folderName} (${verified})`;
-      this.diskSummaryNode.dataset.state = 'ready';
+      if (dropboxActive) {
+        afterSessionTargets.push('Dropbox');
+      }
+      if (icecastLive) {
+        afterSessionTargets.push('Icecast live');
+      }
+      this.cloudSummaryNode.textContent = afterSessionTargets.length
+        ? `Outputs: ${afterSessionTargets.join(' • ')}`
+        : 'After-session save: Browser buffer only';
+      this.cloudSummaryNode.dataset.state = afterSessionTargets.length ? 'ready' : 'pending';
+    }
+    this.updateGuestBackupControls();
+  }
+
+  updateDestinationLights(driveActive, dropboxActive, diskReady, diskMeta, guestBackup) {
+    const setLight = (key, state, statusText) => {
+      const light = this.destinationLights[key];
+      if (!light) return;
+      light.el.dataset.state = state;
+      if (light.status) light.status.textContent = statusText || '';
+    };
+
+    setLight('download', 'green', 'Always on');
+
+    setLight('dropbox', dropboxActive ? 'green' : 'gray',
+      dropboxActive ? 'After recording' : 'Not connected');
+
+    // Drive = guest direct upload path
+    if (!driveActive) {
+      setLight('drive', 'gray', 'Not connected');
+    } else if (!guestBackup.total) {
+      setLight('drive', 'yellow', 'Connected — no guests');
+    } else if (!guestBackup.requested) {
+      setLight('drive', 'yellow', 'Connected — not enabled');
+    } else if (guestBackup.confirmed === guestBackup.total) {
+      setLight('drive', 'green', `${guestBackup.confirmed}/${guestBackup.total} recording`);
+    } else {
+      setLight('drive', 'yellow', `${guestBackup.confirmed}/${guestBackup.total} confirmed`);
+    }
+
+    if (STUDIO_DISK_FEATURE_FLAG) {
+      if (diskReady) {
+        setLight('disk', 'green', diskMeta.folderName || 'Ready');
+      } else if (diskMeta.enabled) {
+        setLight('disk', 'yellow', 'No folder');
+      } else {
+        setLight('disk', 'gray', 'Not set up');
+      }
     }
   }
 
@@ -3868,7 +5501,26 @@ class PodcastStudioApp {
     if (service === 'dropbox') {
       return 'Dropbox';
     }
+    if (service === 'local') {
+      return 'Local disk';
+    }
     return service || 'Service';
+  }
+
+  normalizeUploadStatus(service, status) {
+    if (service === 'drive' && status === 'uploaded') {
+      // Legacy Drive flows finalize asynchronously after blob handoff.
+      return 'queued';
+    }
+    return status || 'unknown';
+  }
+
+  isDiskDestinationReady() {
+    if (!STUDIO_DISK_FEATURE_FLAG) {
+      return false;
+    }
+    const meta = readDiskRecordingState();
+    return Boolean(meta.enabled && meta.folderName);
   }
 
   createServiceStatusLine(service) {
@@ -3879,9 +5531,26 @@ class PodcastStudioApp {
         ? this.cloud?.hasDriveAccess()
         : service === 'dropbox'
           ? this.cloud?.hasDropboxAccess()
+          : service === 'local'
+            ? this.isDiskDestinationReady()
           : false;
-    const hint = ready ? 'ready' : 'link to upload';
+    const hint = ready
+      ? service === 'local'
+        ? 'armed'
+        : 'ready'
+      : service === 'local'
+        ? 'not armed'
+        : 'link to upload';
     line.textContent = `${this.describeService(service)}: ${hint}`;
+    if (service === 'local') {
+      line.title = ready
+        ? 'Files will be written into the armed local folder after recording stops.'
+        : 'Arm local disk recording above to write files directly into the selected folder.';
+    } else {
+      line.title = ready
+        ? `${this.describeService(service)} is linked; uploads will start when queued.`
+        : `Link ${this.describeService(service)} above to enable uploads.`;
+    }
     return line;
   }
 
@@ -3956,7 +5625,11 @@ class PodcastStudioApp {
     }
     tracker.set(key, entry);
     this.refreshUploadProgress(service);
-    const ttl = status === 'error' ? UPLOAD_TRACKER_COOLDOWN_MS * 2 : UPLOAD_TRACKER_COOLDOWN_MS;
+    const ttl = status === 'error'
+      ? UPLOAD_TRACKER_COOLDOWN_MS * 2
+      : status === 'queued'
+        ? UPLOAD_TRACKER_COOLDOWN_MS * 4
+        : UPLOAD_TRACKER_COOLDOWN_MS;
     setTimeout(() => {
       const current = tracker.get(key);
       if (current && current.status === status) {
@@ -3980,6 +5653,7 @@ class PodcastStudioApp {
     const entries = Array.from(tracker.values());
     const errors = entries.filter((entry) => entry.status === 'error');
     const active = entries.filter((entry) => entry.status === 'pending' || entry.status === 'uploading');
+    const queued = entries.filter((entry) => entry.status === 'queued');
     const completed = entries.filter((entry) => entry.status === 'uploaded');
     const skipped = entries.filter((entry) => entry.status === 'skipped');
     const uploadedBytes = entries.reduce((total, entry) => total + Math.min(entry.bytesUploaded || 0, entry.bytesTotal || entry.bytesUploaded || 0), 0);
@@ -3995,6 +5669,11 @@ class PodcastStudioApp {
       node.dataset.state = 'uploading';
       return;
     }
+    if (queued.length) {
+      node.textContent = `${this.describeService(service)} queued ${queued.length} file${queued.length === 1 ? '' : 's'} • finalizing`;
+      node.dataset.state = 'pending';
+      return;
+    }
     if (completed.length || skipped.length) {
       node.textContent = `${this.describeService(service)} uploads complete`;
       node.dataset.state = 'complete';
@@ -4004,143 +5683,143 @@ class PodcastStudioApp {
     node.dataset.state = 'idle';
   }
 
- applyUploadResult(element, result) {
+  applyUploadResult(element, result) {
     if (!element || !result) {
       return;
     }
-    const label = this.describeService(result.service || element.dataset.service);
-    element.dataset.status = result.status || 'unknown';
-    if (result.status === 'uploaded') {
+    const service = result.service || element.dataset.service;
+    const label = this.describeService(service);
+    const normalizedStatus = this.normalizeUploadStatus(service, result.status);
+    element.dataset.status = normalizedStatus;
+    if (normalizedStatus === 'queued') {
+      const sizeText = result.bytes ? ` (${this.formatFileSize(result.bytes)})` : '';
+      element.textContent = `${label}: queued${sizeText}`;
+    } else if (normalizedStatus === 'uploaded') {
       const sizeText = result.bytes ? ` (${this.formatFileSize(result.bytes)})` : '';
       element.textContent = `${label}: uploaded${sizeText}`;
-    } else if (result.status === 'skipped') {
+    } else if (normalizedStatus === 'skipped') {
       element.textContent = `${label}: ${result.reason || 'skipped'}`;
-    } else if (result.status === 'error') {
+    } else if (normalizedStatus === 'error') {
       const message = result.error?.message || result.error?.toString() || 'failed';
       element.textContent = `${label}: ${message}`;
       element.dataset.status = 'error';
     } else {
-      element.textContent = `${label}: ${result.status || 'unknown'}`;
+      element.textContent = `${label}: ${normalizedStatus}`;
     }
   }
 
-  enqueuePendingDriveUpload(meta, driveElement) {
-    if (!meta || !meta.blob) {
-      return;
-    }
-    const existing = this.pendingDriveUploads.find((entry) => entry.meta === meta);
-    if (existing) {
-      if (driveElement) {
-        existing.driveElement = driveElement;
-      }
-      return;
-    }
-    this.pendingDriveUploads.push({
-      meta,
-      driveElement: driveElement || null,
-    });
-    if (driveElement) {
-      driveElement.dataset.status = 'pending';
-      driveElement.textContent = `${this.describeService('drive')}: waiting for link…`;
-    }
+  sanitizeDiskFilename(filename, fallbackExt = 'wav') {
+    const fallback = `podcast-track-${Date.now()}.${fallbackExt}`;
+    const input = (filename || fallback).toString();
+    const safe = input
+      .replace(/[\\/:*?"<>|]+/g, '-')
+      .replace(/\s+/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^-+|-+$/g, '');
+    return safe || fallback;
   }
 
-  async flushPendingDriveUploads() {
-    if (!this.pendingDriveUploads.length || !this.cloud?.hasDriveAccess()) {
-      return;
+  async saveBlobToArmedDisk(blob, filename) {
+    if (!blob) {
+      throw new Error('No recording blob available for disk write.');
     }
-    const pending = [...this.pendingDriveUploads];
-    this.pendingDriveUploads = [];
-    for (const entry of pending) {
-      try {
-        await this.queueCloudUpload(
-          entry.meta,
-          {
-            drive: entry.driveElement,
-          },
-          { driveOnly: true },
-        );
-      } catch (error) {
-        console.warn('Deferred Drive upload failed', error);
-      }
+    const verify = await verifyStoredDiskRecordingDirectory({ requestPermission: false });
+    if (!verify.ok) {
+      throw new Error(verify.message || 'Disk folder is not accessible.');
     }
-  }
-
-  async queueCloudUpload(meta, serviceElements = {}, options = {}) {
-    if (!this.cloud || !meta?.blob) {
-      if (serviceElements?.drive) {
-        serviceElements.drive.textContent = 'Drive: unavailable';
-      }
-      if (serviceElements?.dropbox) {
-        serviceElements.dropbox.textContent = 'Dropbox: unavailable';
-      }
-      return;
+    const directoryHandle = await readDiskDirectoryHandle();
+    if (!directoryHandle) {
+      throw new Error('No local disk folder is selected.');
     }
-
-    const driveOnly = options.driveOnly === true;
-
-    let driveClient = null;
-    let driveReady = false;
+    const guessedExt = blob.type && blob.type.includes('/')
+      ? (blob.type.split('/')[1] || 'bin').split(';')[0]
+      : 'bin';
+    const safeFilename = this.sanitizeDiskFilename(filename, guessedExt);
+    const fileHandle = await directoryHandle.getFileHandle(safeFilename, { create: true });
+    const writable = await fileHandle.createWritable();
     try {
-      driveClient = this.cloud.ensureDriveClient();
-      driveReady = Boolean(this.cloud?.hasDriveAccess());
+      await writable.write(blob);
+      await writable.close();
     } catch (error) {
-      console.warn('Drive client unavailable; continuing without Drive uploads', error);
-    }
-    let canDropbox = !driveOnly && Boolean(this.cloud?.hasDropboxAccess());
-    if (!driveOnly && !canDropbox) {
       try {
-        const dropboxClient = await this.cloud.ensureDropboxClient();
-        canDropbox = Boolean(dropboxClient);
+        await writable.abort();
+      } catch (abortError) {
+        console.warn('Unable to abort disk writer after failure', abortError);
+      }
+      throw error;
+    }
+    return {
+      filename: safeFilename,
+      bytes: blob.size || 0,
+      folderName: verify.folderName || readDiskRecordingState().folderName || null,
+    };
+  }
+
+  async queueLocalDiskWrite(meta, localElement) {
+    if (!localElement) {
+      return { status: 'skipped', service: 'local', reason: 'not-visible' };
+    }
+    if (!meta?.blob) {
+      localElement.dataset.status = 'error';
+      localElement.textContent = 'Local disk: missing file data';
+      return { status: 'error', service: 'local', error: new Error('Missing recording blob') };
+    }
+    if (!this.isDiskDestinationReady()) {
+      localElement.dataset.status = 'skipped';
+      localElement.textContent = 'Local folder: not configured (download only)';
+      return { status: 'skipped', service: 'local', reason: 'not-armed' };
+    }
+    localElement.dataset.status = 'pending';
+    localElement.textContent = 'Local disk: writing…';
+    try {
+      const saved = await this.saveBlobToArmedDisk(meta.blob, meta.filename);
+      localElement.dataset.status = 'uploaded';
+      const sizeText = saved.bytes ? ` (${this.formatFileSize(saved.bytes)})` : '';
+      localElement.textContent = `Local disk: saved${sizeText}`;
+      localElement.title = saved.folderName
+        ? `Saved to local folder: ${saved.folderName}`
+        : 'Saved to the armed local folder.';
+      return { status: 'uploaded', service: 'local', ...saved };
+    } catch (error) {
+      console.error('Failed writing recording to local disk', error);
+      localElement.dataset.status = 'error';
+      localElement.textContent = `Local disk: ${error?.message || 'write failed'}`;
+      localElement.title = 'Local disk write failed.';
+      return { status: 'error', service: 'local', error };
+    }
+  }
+
+  async queueDropboxUpload(meta, dropboxLine) {
+    if (!this.cloud || !meta?.blob) {
+      if (dropboxLine) dropboxLine.textContent = 'Dropbox: unavailable';
+      return;
+    }
+    let canDropbox = Boolean(this.cloud?.hasDropboxAccess());
+    if (!canDropbox) {
+      try {
+        const client = await this.cloud.ensureDropboxClient();
+        canDropbox = Boolean(client);
       } catch (error) {
-        console.warn('Dropbox client unavailable; continuing without Dropbox uploads', error);
+        console.warn('Dropbox client unavailable', error);
       }
     }
+    if (dropboxLine) {
+      dropboxLine.textContent = `${this.describeService('dropbox')}: ${canDropbox ? 'preparing upload…' : 'not connected'}`;
+      dropboxLine.dataset.status = canDropbox ? 'pending' : 'idle';
+    }
+    if (!canDropbox) return;
 
-    if (serviceElements?.drive) {
-      const driveHint = driveReady ? 'preparing upload…' : 'link to upload';
-      serviceElements.drive.textContent = `${this.describeService('drive')}: ${driveHint}`;
-      serviceElements.drive.dataset.status = driveReady ? 'pending' : 'idle';
-    }
-    if (!driveOnly && serviceElements?.dropbox) {
-      serviceElements.dropbox.textContent = `${this.describeService('dropbox')}: ${canDropbox ? 'preparing upload…' : 'link to upload'}`;
-      serviceElements.dropbox.dataset.status = canDropbox ? 'pending' : 'idle';
-    }
-
-    const uploadKeys = {};
-    const allowDriveUpload = driveReady && Boolean(driveClient);
-    if (allowDriveUpload) {
-      uploadKeys.drive = this.registerUploadTask('drive', meta);
-    } else if (!driveOnly && driveClient) {
-      this.enqueuePendingDriveUpload(meta, serviceElements?.drive || null);
-    }
-    if (!driveOnly && canDropbox) {
-      uploadKeys.dropbox = this.registerUploadTask('dropbox', meta);
-    }
-
+    const uploadKey = this.registerUploadTask('dropbox', meta);
     try {
       const results = await this.cloud.uploadBlob(meta.blob, {
         filename: meta.filename,
-        drive: allowDriveUpload,
-        dropbox: !driveOnly && canDropbox,
+        drive: false,
+        dropbox: true,
         onProgress: (progress) => {
-          if (!progress?.service) {
-            return;
-          }
-          const label = this.describeService(progress.service);
-          if (progress.service === 'drive' && serviceElements?.drive) {
-            serviceElements.drive.textContent = `${label}: ${progress.percentage || 0}%`;
-            if (uploadKeys.drive) {
-              this.updateUploadTask('drive', uploadKeys.drive, {
-                uploaded: progress.uploaded,
-                total: progress.total,
-                status: 'uploading',
-              });
-            }
-          } else if (progress.service === 'dropbox' && serviceElements?.dropbox) {
-            serviceElements.dropbox.textContent = `${label}: ${progress.percentage || 0}%`;
-            if (uploadKeys.dropbox) {
-              this.updateUploadTask('dropbox', uploadKeys.dropbox, {
+          if (progress?.service === 'dropbox' && dropboxLine) {
+            dropboxLine.textContent = `${this.describeService('dropbox')}: ${progress.percentage || 0}%`;
+            if (uploadKey) {
+              this.updateUploadTask('dropbox', uploadKey, {
                 uploaded: progress.uploaded,
                 total: progress.total,
                 status: 'uploading',
@@ -4150,33 +5829,19 @@ class PodcastStudioApp {
         },
         signal: this.abortUploadsController?.signal,
       });
-      if (allowDriveUpload) {
-        this.applyUploadResult(serviceElements?.drive, results.drive);
-      }
-      if (!driveOnly) {
-        this.applyUploadResult(serviceElements?.dropbox, results.dropbox);
-      }
-      if (uploadKeys.drive) {
-        this.finalizeUploadTask('drive', uploadKeys.drive, results.drive?.status || 'unknown');
-      }
-      if (uploadKeys.dropbox) {
-        this.finalizeUploadTask('dropbox', uploadKeys.dropbox, results.dropbox?.status || 'unknown');
+      this.applyUploadResult(dropboxLine, results.dropbox);
+      if (uploadKey) {
+        const status = this.normalizeUploadStatus('dropbox', results.dropbox?.status || 'unknown');
+        this.finalizeUploadTask('dropbox', uploadKey, status);
       }
     } catch (error) {
-      console.error('Cloud upload failed', error);
-      if (allowDriveUpload && serviceElements?.drive) {
-        serviceElements.drive.textContent = 'Drive: upload failed';
-        serviceElements.drive.dataset.status = 'error';
+      console.error('Dropbox upload failed', error);
+      if (dropboxLine) {
+        dropboxLine.textContent = 'Dropbox: upload failed';
+        dropboxLine.dataset.status = 'error';
       }
-      if (!driveOnly && serviceElements?.dropbox) {
-        serviceElements.dropbox.textContent = 'Dropbox: upload failed';
-        serviceElements.dropbox.dataset.status = 'error';
-      }
-      if (uploadKeys.drive) {
-        this.finalizeUploadTask('drive', uploadKeys.drive, 'error');
-      }
-      if (uploadKeys.dropbox) {
-        this.finalizeUploadTask('dropbox', uploadKeys.dropbox, 'error');
+      if (uploadKey) {
+        this.finalizeUploadTask('dropbox', uploadKey, 'error');
       }
     } finally {
       this.updateCloudFooter();
@@ -4198,6 +5863,10 @@ class PodcastStudioApp {
   }
 
   dispose() {
+    this.driveRequestTimers.forEach((_timers, uuid) => {
+      this.clearDriveRequestTimers(uuid);
+    });
+    this.stopRecordingStatusTimer();
     if (this.rosterTimer) {
       clearInterval(this.rosterTimer);
       this.rosterTimer = null;
@@ -4214,6 +5883,10 @@ class PodcastStudioApp {
       window.removeEventListener(DRIVE_PROGRESS_EVENT, this.boundDriveProgressHandler);
       this.boundDriveProgressHandler = null;
     }
+    if (this.boundRemoteRecorderHandler) {
+      window.removeEventListener(REMOTE_RECORDER_EVENT, this.boundRemoteRecorderHandler);
+      this.boundRemoteRecorderHandler = null;
+    }
     if (this.levelOff) {
       this.levelOff();
       this.levelOff = null;
@@ -4221,6 +5894,11 @@ class PodcastStudioApp {
     if (this.abortUploadsController) {
       this.abortUploadsController.abort();
       this.abortUploadsController = null;
+    }
+    if (this.icecastPublisher?.isLive()) {
+      this.icecastPublisher.stop({ quiet: true }).catch((error) => {
+        console.warn('Failed to stop Icecast publisher during dispose', error);
+      });
     }
     if (this.hostMic?.active || this.virtualParticipants.size) {
       this.disableHostMic().catch((error) => {
@@ -4306,6 +5984,7 @@ class PodcastStudioApp {
     this.remoteOverlayContent = null;
     this.rosterDriveButtons.clear();
     this.rosterDriveStatuses.clear();
+    this.driveRecorderStates.clear();
     this.driveStatusResetTimers.forEach((timer) => clearTimeout(timer));
     this.driveStatusResetTimers.clear();
   }
