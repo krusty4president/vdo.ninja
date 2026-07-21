@@ -1668,22 +1668,6 @@ button#press2talk{
 	position: relative;
 }
 
-#chatlitebutton {
-	position: relative;
-}
-
-#chatLiteOverlayFrame {
-	position: fixed;
-	left: 0;
-	top: 0;
-	width: 100vw;
-	height: 100vh;
-	border: 0;
-	background: transparent;
-	pointer-events: none;
-	z-index: 6;
-}
-
 button.btnArmTransferRoom{
 	width:auto;
 	margin-left: 2px;
@@ -2696,19 +2680,19 @@ label {
 	height: 7px;
 	width: inherit;
 	background: #000;
-	left: 0;
+	left: 50%;
 	font-weight: bold;
 	transition: all .3s ease-in;
 }
 
 .inner:before {
 	top: 50%;
-	transform: rotate(45deg);
+	transform: translate(-50%, -50%) rotate(45deg);
 }
 
 .inner:after {
-	bottom: 50%;
-	transform: rotate(-45deg);
+	top: 50%;
+	transform: translate(-50%, -50%) rotate(-45deg);
 }
 
 .outer:hover .labelclass {
@@ -2717,15 +2701,15 @@ label {
 
 .outer:hover .inner:before,
 .outer:hover .inner:after {
-	transform: rotate(0);
+	transform: translate(-50%, -50%) rotate(0);
 }
 
 .outer:hover .inner:before {
-	top: 0;
+	top: 15%;
 }
 
 .outer:hover .inner:after {
-	bottom: 0;
+	top: 85%;
 }
 .microphoneBackground{
 	background-image: url("data:image/svg+xml,%0A%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M 13 4 C 11.90625 4 11 4.90625 11 6 L 11 18 C 11 19.09375 11.90625 20 13 20 L 19 20 C 20.09375 20 21 19.09375 21 18 L 21 6 C 21 4.90625 20.09375 4 19 4 Z M 13 6 L 19 6 L 19 18 L 13 18 Z M 7 14 L 7 18 C 7 21.300781 9.699219 24 13 24 L 15 24 L 15 26 L 11 26 L 11 28 L 21 28 L 21 26 L 17 26 L 17 24 L 19 24 C 22.300781 24 25 21.300781 25 18 L 25 14 L 23 14 L 23 18 C 23 20.21875 21.21875 22 19 22 L 13 22 C 10.78125 22 9 20.21875 9 18 L 9 14 Z'/%3E%3C/svg%3E")!important;
@@ -4241,16 +4225,23 @@ label {
 	overflow-y: scroll;
 	overscroll-behavior: contain;
 	scrollbar-gutter: stable;
-	scrollbar-width: thin;
-	scrollbar-color: rgba(255,255,255,.6) rgba(0,0,0,.2);
+	scrollbar-width: auto;
+	scrollbar-color: auto;
 	padding-bottom: 10px;
 }
 .directorBlock.director-customizer-scroll > div,
 .directorBlock.director-customizer-scroll > div > div {
 	vertical-align: top;
 }
+#customizeLinks1 > .guest-customizer-stretch {
+	min-height: 440px;
+}
+#customizeLinks3 > div > div {
+	min-width: 245px;
+}
 .directorBlock.director-customizer-scroll::-webkit-scrollbar {
 	width: 10px;
+	background: rgba(0,0,0,.18);
 }
 .directorBlock.director-customizer-scroll::-webkit-scrollbar-track {
 	background: rgba(0,0,0,.18);
@@ -6565,8 +6556,8 @@ ul#audioSource3{
 }
 
 .darktheme #grabDirectorSoloLink {
-	background-color: var(--discord-grey-3);
-	border: 1px solid var(--discord-grey-8);
+	background-color: var(--discord-grey-1);
+	border: 1px solid #4a4d55;
 }
 #refreshVideoButton > i{
 	cursor: pointer;
@@ -6578,10 +6569,16 @@ ul#audioSource3{
 	margin-top: 10px;
 }
 #grabDirectorSoloLink {
+	box-sizing: border-box;
 	display: inline-block;
-	font-size: 16px;
-	padding: 2px 6px;
+	font-size: 12px;
+	line-height: 1.35;
+	padding: 3px 6px;
 	width: 100%;
+	max-width: 100%;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 	outline: 0;
 	border-radius: 4px;
 	background-color: var(--lighttheme-1);
@@ -7165,7 +7162,8 @@ body.darktheme ul#roomnotes {
 	content: "\f057"; }
 .la-sun:before {
 	content: "\f185"; }
-	
+.la-cloud-upload-alt:before {
+	content: "\f382"; }
 
 /* Minimal visual refresh overrides — non-invasive, CSS-only. */
 /* CHANGES BELOW MADE 2025-08-22 */
@@ -7552,11 +7550,32 @@ ul#audioSource3 input:checked + label {
     background-color: var(--accent-hover-color) !important;
 }
 
-/* 16) Solo link accent harmonization */
-a.soloLink:link, a.soloLink:visited { color: var(--a-link); }
-.darktheme a.soloLink:link, .darktheme a.soloLink:visited { color: var(--a-dark-link); }
-a.soloLink:hover { color: var(--a-hover); }
-.darktheme a.soloLink:hover { color: var(--a-dark-hover); }
+/* 16) Solo link readability */
+#grabDirectorSoloLink,
+a.soloLink:link,
+a.soloLink:visited {
+	color: #26313d;
+	text-shadow: none;
+}
+a.soloLink:link,
+a.soloLink:visited {
+	font-size: 1em;
+	font-weight: 600;
+}
+#grabDirectorSoloLink:hover,
+a.soloLink:hover {
+	color: var(--a-hover);
+}
+.darktheme #grabDirectorSoloLink,
+.darktheme a.soloLink:link,
+.darktheme a.soloLink:visited {
+	color: var(--discord-text);
+	text-shadow: none;
+}
+.darktheme #grabDirectorSoloLink:hover,
+.darktheme a.soloLink:hover {
+	color: var(--a-dark-hover);
+}
 
 /* 10) Header glass — subtle and safe */
 #header {
